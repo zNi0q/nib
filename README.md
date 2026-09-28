@@ -40,7 +40,7 @@ the palette.
 | Where  | Key | Action |
 |--------|-----|--------|
 | Global | `Ctrl+P` | Command palette |
-|        | `Ctrl+S` | Save |
+|        | `Ctrl+S` | Save now (auto-save usually does it for you) |
 |        | `Ctrl+W` | Close file |
 |        | `Ctrl+Q` | Quit |
 |        | `Ctrl+F` | Find (`Enter` = next, `Esc` = close) |
@@ -65,12 +65,28 @@ the palette.
 - **Atomic saves:** nib writes a temp file and renames it over the original, keeping file permissions.
 - **Line endings kept:** CRLF line endings and the trailing newline (or its absence) are preserved.
 - **Won't open** binary, non-UTF-8, or larger-than-50 MB files, so it never corrupts them.
-- **Asks before losing work:** unsaved changes prompt `y` save / `n` discard / `Esc` cancel.
+- **Auto-save:** saves 1 s after you stop typing, and before switching files, closing,
+  quitting or when the terminal loses focus. Undo still works after a save. Turn it off
+  with the `Toggle auto-save` command (`Ctrl+P`); then unsaved changes prompt
+  `y` save / `n` discard / `Esc` cancel. If a save fails (e.g. read-only file) nib says
+  so once and asks before discarding anything.
 
 ## Syntax highlighting
 
-Rust, Go, C/C++, JS/TS/Vue/Svelte, Java/Kotlin/C#/Dart/Swift, Python, Zig, Shell, Lua,
-SQL, CSS, HTML/XML, JSON, TOML/YAML/INI/Makefile/Dockerfile/.env.
+Hand-written scanners — no grammar files or regexes — so highlighting costs almost
+nothing. After an edit only the changed lines are re-scanned.
+
+| Language | Highlights |
+|---|---|
+| JavaScript, TypeScript, React (JSX/TSX) | keywords, template strings (multi-line), decorators, JSX tags/props |
+| HTML | tags, attributes, entities, comments, inline `<script>` and `<style>` |
+| Vue, Svelte | template tags, `v-`/`@`/`:` and `on:` directives, `{{ }}` / `{#if}` blocks, `<script>` as TS, `<style>` as SCSS |
+| CSS, SCSS, Less | selectors, properties, colors, units, `@rules`, `!important` |
+| Python | keywords, decorators, `"""` docstrings, f-strings |
+| SQL | keywords and types (any case), strings, comments |
+| JSON, YAML, TOML, INI, .env, Dockerfile, Makefile | keys vs values, sections, instructions |
+| Markdown | headings, lists, code spans and fences, bold, links |
+| Rust, Go, C/C++, Java/Kotlin/C#/Dart/Swift, Zig, Shell, Lua | keywords, strings, comments, numbers, calls, types |
 
 ## Limitations
 
