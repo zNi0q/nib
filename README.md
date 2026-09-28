@@ -123,9 +123,11 @@ status bar and the message at the bottom when the cursor is on that line.
 - server messages and key presses share one queue, so nib sleeps with zero CPU when idle;
 - stored diagnostics and completion lists are capped; server logs are discarded.
 
-nib itself uses **1.3–2 MB of RAM** (80×24 to 200×50 terminal): on Linux it is built
-as a static musl binary (no shared libc to map), with a size-optimized profile and
-40-byte screen cells. Quitting, closing the terminal window or `kill` stops every
+nib itself uses **about 1 MB of RAM** at any terminal size, from a ~0.95 MB binary with
+three dependencies (crossterm, serde_json, unicode-width). Like vim, it has its own
+screen renderer (8-byte cells, only changed cells are redrawn) and its own small TOML
+parser; on Linux it is a static musl binary, so no shared libc is loaded. Quitting,
+closing the terminal window or `kill` stops every
 language server and anything it started, after saving your edits.
 
 A plugin file:
