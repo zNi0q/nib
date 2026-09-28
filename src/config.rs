@@ -500,7 +500,7 @@ mod tests {
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!((cfg.settings.tab_width, cfg.settings.sidebar_width), (2, 20));
         assert_eq!(cfg.theme.keyword, theme::GRUVBOX.keyword);
-        assert_eq!(cfg.theme.string, ratatui_core::style::Color::Rgb(1, 2, 3));
+        assert_eq!(cfg.theme.string, crate::screen::Color::Rgb(1, 2, 3));
         assert!(!cfg.settings.lsp_enabled && cfg.settings.lsp_idle_timeout == 5);
     }
 }

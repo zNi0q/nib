@@ -1,4 +1,4 @@
-use ratatui_core::style::Color;
+use crate::screen::Color;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Theme {

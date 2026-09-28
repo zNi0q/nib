@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui_core::layout::Rect;
+use crate::screen::Rect;
 
 use crate::buffer::{char_at_col, display_col, Buffer, Pos};
 use crate::highlight::{highlight_line, lang_for, State};

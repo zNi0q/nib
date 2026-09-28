@@ -60,7 +60,7 @@ mod signals {
 }
 
 mod terminal {
-    use std::io::{stdout, Stdout};
+    use std::io::stdout;
 
     use crossterm::event::{
         DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange,
@@ -68,10 +68,9 @@ mod terminal {
     };
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
     use crossterm::{cursor, execute};
-    use ratatui_core::terminal::Terminal;
-    use ratatui_crossterm::CrosstermBackend;
+    use nib::screen::Screen;
 
-    pub fn enter() -> std::io::Result<Terminal<CrosstermBackend<Stdout>>> {
+    pub fn enter() -> std::io::Result<Screen> {
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             leave();
@@ -79,7 +78,8 @@ mod terminal {
         }));
         enable_raw_mode()?;
         execute!(stdout(), EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste, EnableFocusChange)?;
-        Terminal::new(CrosstermBackend::new(stdout()))
+        let (w, h) = crossterm::terminal::size()?;
+        Ok(Screen::new(w, h))
     }
 
     pub fn leave() {
@@ -125,7 +125,8 @@ fn main() -> std::io::Result<()> {
     let idle = cfg.settings.lsp_idle_timeout;
     app.apply_config(cfg);
 
-    let mut term = terminal::enter()?;
+    let mut screen = terminal::enter()?;
+    let mut out = std::io::stdout();
 
     let (tx, rx) = mpsc::channel();
     let input = tx.clone();
@@ -157,7 +158,9 @@ fn main() -> std::io::Result<()> {
 
     let res = (|| -> std::io::Result<()> {
         while !app.quit {
-            term.draw(|f| nib::ui::draw(f, &mut app))?;
+            screen.begin();
+            nib::ui::draw(&mut screen, &mut app);
+            screen.flush(&mut out)?;
             let first = match app.next_wake() {
                 Some(t) => match rx.recv_timeout(t.saturating_duration_since(Instant::now())) {
                     Ok(w) => Some(w),
@@ -175,6 +178,7 @@ fn main() -> std::io::Result<()> {
                     Wake::Term(Event::Paste(s)) => app.on_paste(&s),
                     Wake::Term(Event::Mouse(m)) => app.on_mouse(m),
                     Wake::Term(Event::FocusLost) => app.flush(),
+                    Wake::Term(Event::Resize(w, h)) => screen.resize(w, h),
                     Wake::Term(_) => {}
                     Wake::Lsp(id, msg) => app.on_lsp(id, msg),
                     Wake::Closed => app.quit = true,

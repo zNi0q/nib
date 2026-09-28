@@ -1,17 +1,9 @@
-use ratatui_core::layout::{Constraint, Layout, Rect};
-use ratatui_core::style::{Color, Modifier, Style};
-use ratatui_core::terminal::Frame;
-use ratatui_core::text::{Line, Span};
-use ratatui_widgets::block::Block;
-use ratatui_widgets::borders::Borders;
-use ratatui_widgets::clear::Clear;
-use ratatui_widgets::paragraph::Paragraph;
-
 use crate::app::{severity_label, After, App, Focus, Popup, Prompt};
-use crate::lsp::{Diag, Severity};
 use crate::buffer::{char_width, display_col};
 use crate::highlight::{highlight_line, lang_for, Tok};
 use crate::icons::{self, icon_for};
+use crate::lsp::{Diag, Severity};
+use crate::screen::{fg, Color, Rect, Screen, Style};
 use crate::theme::Theme;
 
 fn sev_color(th: &Theme, s: Severity) -> Color {
@@ -38,145 +30,133 @@ fn diags(app: &App) -> &[Diag] {
 }
 
 fn tok_style(th: &Theme, t: Tok) -> Style {
-    let s = Style::default();
     match t {
-        Tok::Text => s.fg(th.text),
-        Tok::Keyword => s.fg(th.keyword),
-        Tok::Str => s.fg(th.string),
-        Tok::Comment => s.fg(th.comment).add_modifier(Modifier::ITALIC),
-        Tok::Number => s.fg(th.number),
-        Tok::Func => s.fg(th.function),
-        Tok::Type => s.fg(th.ty),
-        Tok::Tag => s.fg(th.tag),
-        Tok::Attr => s.fg(th.attribute),
+        Tok::Text => fg(th.text),
+        Tok::Keyword => fg(th.keyword),
+        Tok::Str => fg(th.string),
+        Tok::Comment => fg(th.comment).italic(),
+        Tok::Number => fg(th.number),
+        Tok::Func => fg(th.function),
+        Tok::Type => fg(th.ty),
+        Tok::Tag => fg(th.tag),
+        Tok::Attr => fg(th.attribute),
     }
 }
 
-pub fn draw(f: &mut Frame, app: &mut App) {
-    let [main, status, bottom] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(1), Constraint::Length(1)]).areas(f.area());
+fn width_of(s: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    s.width()
+}
+
+pub fn draw(scr: &mut Screen, app: &mut App) {
+    let full = scr.area();
+    let main = Rect { height: full.height.saturating_sub(2), ..full };
+    let status = Rect { y: full.height.saturating_sub(2), height: 1.min(full.height), ..full };
+    let bottom = Rect { y: full.height.saturating_sub(1), height: 1.min(full.height), ..full };
     let editor = if app.show_tree {
-        let [tree, editor] = Layout::horizontal([Constraint::Length(app.settings.sidebar_width), Constraint::Min(10)]).areas(main);
-        draw_tree(f, app, tree);
-        editor
+        let tree_w = app.settings.sidebar_width.min(main.width.saturating_sub(10));
+        draw_tree(scr, app, Rect { width: tree_w, ..main });
+        Rect { x: main.x + tree_w, width: main.width - tree_w, ..main }
     } else {
         app.tree_area = Rect::default();
         main
     };
-    draw_editor(f, app, editor);
-    draw_status(f, app, status);
-    draw_bottom(f, app, bottom);
+    draw_editor(scr, app, editor);
+    draw_status(scr, app, status);
+    draw_bottom(scr, app, bottom);
     if let Some(Prompt::Palette { query, sel }) = &app.prompt {
-        draw_palette(f, app, query, *sel);
+        draw_palette(scr, app, query, *sel);
     } else {
-        draw_popup(f, app);
+        draw_popup(scr, app);
     }
 }
 
-fn draw_palette(f: &mut Frame, app: &App, query: &str, sel: usize) {
+fn draw_palette(scr: &mut Screen, app: &App, query: &str, sel: usize) {
     let th = &app.theme;
     let matches = App::palette_matches(query);
-    let screen = f.area();
+    let screen = scr.area();
     let w = 56.min(screen.width.saturating_sub(4));
     let h = (matches.len().max(1) as u16 + 4).min(screen.height.saturating_sub(2));
-    let area = Rect { x: screen.x + (screen.width - w) / 2, y: screen.y + screen.height / 6, width: w, height: h };
-    let block = Block::bordered()
-        .border_style(Style::default().fg(th.accent))
-        .title(Span::styled(" Commands ", Style::default().fg(th.accent).add_modifier(Modifier::BOLD)));
-    let inner = block.inner(area);
-    f.render_widget(Clear, area);
-    f.render_widget(block, area);
-
-    let input = Line::from(vec![
-        Span::styled(" > ", Style::default().fg(th.warning)),
-        Span::styled(query.to_string(), Style::default().fg(th.text).add_modifier(Modifier::BOLD)),
-    ]);
-    let mut lines = vec![input, Line::from(Span::styled("─".repeat(inner.width as usize), Style::default().fg(th.dim)))];
+    let area = Rect { x: (screen.width - w) / 2, y: screen.height / 6, width: w, height: h };
+    scr.boxed(area, fg(th.accent), " Commands ", fg(th.accent).bold());
+    let inner = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: area.height.saturating_sub(2) };
+    let right = inner.right();
+    scr.put_spans(inner.x, inner.y, &[(" > ", fg(th.warning)), (query, fg(th.text).bold())], right);
+    scr.put(inner.x, inner.y + 1, &"─".repeat(inner.width as usize), fg(th.dim), right);
     if matches.is_empty() {
-        lines.push(Line::from(Span::styled(" no matching command", Style::default().fg(th.dim))));
+        scr.put(inner.x, inner.y + 2, " no matching command", fg(th.dim), right);
     }
     let rows = inner.height.saturating_sub(2) as usize;
     let first = sel.saturating_sub(rows.saturating_sub(1));
-    for (i, c) in matches.iter().enumerate().skip(first).take(rows) {
+    for (row, (i, c)) in matches.iter().enumerate().skip(first).take(rows).enumerate() {
+        let y = inner.y + 2 + row as u16;
         let keys = app.keymap.label(c.cmd);
-        let pad = (inner.width as usize).saturating_sub(c.name.chars().count() + keys.len() + 3);
-        let mut style = Style::default().fg(th.text);
+        let mut style = fg(th.text);
         if i == sel {
-            style = style.bg(th.selection).fg(th.accent).add_modifier(Modifier::BOLD);
+            style = style.bg(th.selection).fg(th.accent).bold();
+            scr.fill(Rect { y, height: 1, ..inner }, style);
         }
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {}{}", c.name, " ".repeat(pad)), style),
-            Span::styled(format!("{keys}  "), style.fg(th.dim)),
-        ]));
+        scr.put(inner.x, y, &format!(" {}", c.name), style, right);
+        let kx = right.saturating_sub(width_of(&keys) as u16 + 2);
+        scr.put(kx, y, &keys, style.fg(th.dim), right);
     }
-    f.render_widget(Paragraph::new(lines), inner);
-    f.set_cursor_position((inner.x + 3 + query.chars().count() as u16, inner.y));
+    scr.set_cursor(inner.x + 3 + query.chars().count() as u16, inner.y);
 }
 
-fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
+fn draw_tree(scr: &mut Screen, app: &mut App, area: Rect) {
     let th = app.theme;
+    if area.width < 2 || area.height == 0 {
+        return;
+    }
     let focused = app.focus == Focus::Tree;
     let root = app.tree.root.file_name().map_or("/".into(), |n| n.to_string_lossy().into_owned());
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(if focused { th.accent } else { th.dim }))
-        .title(Span::styled(format!(" {root} "), Style::default().fg(th.accent).add_modifier(Modifier::BOLD)));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    let list = Rect { y: inner.y + 1, height: inner.height.saturating_sub(1), ..inner };
+    let border_x = area.right() - 1;
+    for y in area.y..area.bottom() {
+        scr.put(border_x, y, "│", fg(if focused { th.accent } else { th.dim }), area.right());
+    }
+    scr.put(area.x, area.y, &format!(" {root} "), fg(th.accent).bold(), border_x);
+    let list = Rect { x: area.x, y: area.y + 1, width: area.width - 1, height: area.height.saturating_sub(1) };
     app.tree_area = list;
     app.follow_cursor();
 
     let open = app.buf.as_ref().and_then(|b| b.path.clone());
     let show_icons = app.settings.icons && icons::enabled();
-    let lines: Vec<Line> = app
-        .tree
-        .items
-        .iter()
-        .enumerate()
-        .skip(app.tree.scroll)
-        .take(list.height as usize)
-        .map(|(i, e)| {
-            let (chevron, name, mut style) = if e.is_dir {
-                (if e.expanded { "▾ " } else { "▸ " }, format!("{}/", e.name), Style::default().fg(th.accent))
-            } else {
-                let s = if open.as_ref() == Some(&e.path) { Style::default().fg(th.warning) } else { Style::default().fg(th.text) };
-                ("  ", e.name.clone(), s)
-            };
-            let mut icon_style = style;
-            let icon = if show_icons {
-                let (glyph, color) = icon_for(&e.name, e.is_dir, e.expanded);
-                icon_style = icon_style.fg(color);
-                format!("{glyph} ")
-            } else {
-                String::new()
-            };
-            if i == app.tree.sel {
-                style = style.bg(th.selection).add_modifier(Modifier::BOLD);
-                icon_style = icon_style.bg(th.selection);
-                if focused {
-                    style = style.add_modifier(Modifier::REVERSED);
-                    icon_style = icon_style.add_modifier(Modifier::REVERSED);
-                }
+    let rows = app.tree.items.iter().enumerate().skip(app.tree.scroll).take(list.height as usize);
+    for (row, (i, e)) in rows.enumerate() {
+        let y = list.y + row as u16;
+        let (chevron, name, mut style) = if e.is_dir {
+            (if e.expanded { "▾ " } else { "▸ " }, format!("{}/", e.name), fg(th.accent))
+        } else {
+            let s = if open.as_ref() == Some(&e.path) { fg(th.warning) } else { fg(th.text) };
+            ("  ", e.name.clone(), s)
+        };
+        let mut icon_style = style;
+        let icon = if show_icons {
+            let (glyph, color) = icon_for(&e.name, e.is_dir, e.expanded);
+            icon_style = icon_style.fg(color);
+            format!("{glyph} ")
+        } else {
+            String::new()
+        };
+        if i == app.tree.sel {
+            style = style.bg(th.selection).bold();
+            icon_style = icon_style.bg(th.selection);
+            if focused {
+                style = style.reversed();
+                icon_style = icon_style.reversed();
             }
-            let lead = format!(" {}{chevron}", "  ".repeat(e.depth));
-            let used = lead.chars().count() + icon.chars().count() + name.chars().count();
-            let pad = " ".repeat((list.width as usize).saturating_sub(used));
-            Line::from(vec![
-                Span::styled(lead, style),
-                Span::styled(icon, icon_style),
-                Span::styled(format!("{name}{pad}"), style),
-            ])
-        })
-        .collect();
-    f.render_widget(Paragraph::new(lines), list);
+            scr.fill(Rect { y, height: 1, ..list }, style);
+        }
+        let lead = format!(" {}{chevron}", "  ".repeat(e.depth));
+        scr.put_spans(list.x, y, &[(&lead, style), (&icon, icon_style), (&name, style)], list.right());
+    }
 }
 
-fn draw_editor(f: &mut Frame, app: &mut App, area: Rect) {
+fn draw_editor(scr: &mut Screen, app: &mut App, area: Rect) {
     let th = app.theme;
     if app.buf.is_none() {
         app.text_area = area;
-        return draw_welcome(f, &app.theme, area);
+        return draw_welcome(scr, &th, area);
     }
     let numbers = app.settings.line_numbers;
     let digits = if numbers { app.buf.as_ref().unwrap().lines.len().to_string().len().max(3) } else { 0 };
@@ -195,54 +175,56 @@ fn draw_editor(f: &mut Frame, app: &mut App, area: Rect) {
         let m = &mut marks[d.line - sy];
         *m = Some(m.map_or(d.severity, |s| s.min(d.severity)));
     }
-    let mut gut = Vec::new();
-    let mut rows = Vec::new();
     for y in sy..end {
+        let row = area.y + (y - sy) as u16;
         let line = &buf.lines[y];
         let current = y == buf.cur.y;
         let (mark, mark_style) = match marks[y - sy] {
-            Some(sev) => (sev_mark(sev), Style::default().fg(sev_color(&th, sev))),
+            Some(sev) => (sev_mark(sev), fg(sev_color(&th, sev))),
             None => (" ", Style::default()),
         };
-        gut.push(Line::from(vec![
-            Span::styled(if numbers { format!("{:>digits$}", y + 1) } else { String::new() }, if current { Style::default().fg(th.warning) } else { Style::default().fg(th.dim) }),
-            Span::styled(mark, mark_style),
-            Span::raw(" "),
-        ]));
+        let num = if numbers { format!("{:>digits$}", y + 1) } else { String::new() };
+        let num_style = fg(if current { th.warning } else { th.dim });
+        scr.put_spans(area.x, row, &[(&num, num_style), (mark, mark_style)], text.x);
+
+        let base = if current { Style::default().bg(th.selection) } else { Style::default() };
+        if current {
+            scr.fill(Rect { y: row, height: 1, ..text }, base);
+        }
         let toks = match lang {
             Some(l) => highlight_line(line, l, &mut states.get(y).copied().unwrap_or_default()),
             None => vec![Tok::Text; line.chars().count()],
         };
-        let mut spans: Vec<Span> = Vec::new();
         let mut col = 0;
+        let mut tmp = [0u8; 4];
         for (c, t) in line.chars().zip(toks) {
             let w = char_width(c, col);
-            let shown: String = match c {
-                '\t' => " ".repeat(w),
-                c if c.is_control() => "·".into(),
-                c => c.to_string(),
-            };
             if col >= sx && col + w <= sx + text.width as usize {
-                spans.push(Span::styled(shown, tok_style(&th, t)));
+                let x = text.x + (col - sx) as u16;
+                let style = tok_style(&th, t).bg(base.bg);
+                match c {
+                    '\t' => {
+                        scr.put(x, row, &" ".repeat(w), style, text.right());
+                    }
+                    c if c.is_control() => {
+                        scr.put(x, row, "·", style, text.right());
+                    }
+                    c => {
+                        scr.put(x, row, c.encode_utf8(&mut tmp), style, text.right());
+                    }
+                }
             }
             col += w;
         }
-        let mut l = Line::from(spans);
-        if current {
-            l = l.style(Style::default().bg(th.selection));
-        }
-        rows.push(l);
     }
-    f.render_widget(Paragraph::new(gut), Rect { width: gutter, ..area });
-    f.render_widget(Paragraph::new(rows), text);
 
     if app.focus == Focus::Editor && app.prompt.is_none() {
         let cx = display_col(&buf.lines[buf.cur.y], buf.cur.x) - sx;
-        f.set_cursor_position((text.x + cx as u16, text.y + (buf.cur.y - sy) as u16));
+        scr.set_cursor(text.x + cx as u16, text.y + (buf.cur.y - sy) as u16);
     }
 }
 
-fn draw_welcome(f: &mut Frame, th: &Theme, area: Rect) {
+fn draw_welcome(scr: &mut Screen, th: &Theme, area: Rect) {
     let logo = [
         "        _ _     ",
         "  _ __ (_) |__  ",
@@ -260,36 +242,41 @@ fn draw_welcome(f: &mut Frame, th: &Theme, area: Rect) {
         ("Ctrl+E", "switch tree ↔ editor"),
         ("Ctrl+B", "hide / show tree"),
     ];
-    let mut lines: Vec<Line> = logo.iter().map(|l| Line::from(Span::styled(*l, Style::default().fg(th.accent)))).collect();
-    lines.push(Line::from(Span::styled("a small editor for code", Style::default().fg(th.dim))));
-    lines.push(Line::from(""));
+    let mut lines: Vec<Vec<(String, Style)>> = logo.iter().map(|l| vec![(l.to_string(), fg(th.accent))]).collect();
+    lines.push(vec![("a small editor for code".into(), fg(th.dim))]);
+    lines.push(Vec::new());
     for (k, d) in keys {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{k:>8}  "), Style::default().fg(th.warning)),
-            Span::styled(format!("{d:<22}"), Style::default().fg(th.text)),
-        ]));
+        lines.push(vec![(format!("{k:>8}  "), fg(th.warning)), (format!("{d:<22}"), fg(th.text))]);
     }
-    let h = lines.len() as u16;
-    let y = area.y + area.height.saturating_sub(h) / 2;
-    f.render_widget(Paragraph::new(lines).centered(), Rect { y, height: h.min(area.height), ..area });
+    let top = area.y + area.height.saturating_sub(lines.len() as u16) / 2;
+    for (i, spans) in lines.iter().enumerate() {
+        let y = top + i as u16;
+        if y >= area.bottom() {
+            break;
+        }
+        let w: usize = spans.iter().map(|(t, _)| width_of(t)).sum();
+        let x = area.x + area.width.saturating_sub(w as u16) / 2;
+        let spans: Vec<(&str, Style)> = spans.iter().map(|(t, s)| (t.as_str(), *s)).collect();
+        scr.put_spans(x, y, &spans, area.right());
+    }
 }
 
-fn draw_status(f: &mut Frame, app: &App, area: Rect) {
+fn draw_status(scr: &mut Screen, app: &App, area: Rect) {
     let th = app.theme;
     let bar = Style::default().bg(th.bar).fg(th.text);
-    let mode = Span::styled(" NIB ", Style::default().bg(th.accent).fg(Color::Black).add_modifier(Modifier::BOLD));
-    let mut left = vec![mode];
+    scr.fill(area, bar);
+    let mut left: Vec<(String, Style)> = vec![(" NIB ".into(), Style::default().bg(th.accent).fg(Color::Black).bold())];
     let mut right = String::new();
     if let Some(b) = &app.buf {
         let name = b.path.as_ref().map_or("[no name]".into(), |p| app.rel(p));
         if app.settings.icons && icons::enabled() {
             let file = b.path.as_ref().and_then(|p| p.file_name()).map_or(String::new(), |n| n.to_string_lossy().into_owned());
             let (glyph, color) = icon_for(&file, false, false);
-            left.push(Span::styled(format!(" {glyph}"), bar.fg(color)));
+            left.push((format!(" {glyph}"), bar.fg(color)));
         }
-        left.push(Span::styled(format!(" {name}"), bar.add_modifier(Modifier::BOLD)));
+        left.push((format!(" {name}"), bar.bold()));
         if b.dirty {
-            left.push(Span::styled(" ●", bar.fg(th.warning)));
+            left.push((" ●".into(), bar.fg(th.warning)));
         }
         let lang = b.path.as_deref().and_then(lang_for).map_or("Text", |l| l.name);
         right = format!(
@@ -301,36 +288,38 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             lang
         );
     }
-    left.push(Span::styled("  ^P commands", bar.fg(th.dim)));
+    left.push(("  ^P commands".into(), bar.fg(th.dim)));
     let (errors, warnings) = diags(app).iter().fold((0, 0), |(e, w), d| match d.severity {
         Severity::Error => (e + 1, w),
         Severity::Warning => (e, w + 1),
         _ => (e, w),
     });
-    let mut lsp_spans = Vec::new();
+    let mut lsp: Vec<(String, Style)> = Vec::new();
     if errors > 0 {
-        lsp_spans.push(Span::styled(format!("✖ {errors}  "), bar.fg(th.error)));
+        lsp.push((format!("✖ {errors}  "), bar.fg(th.error)));
     }
     if warnings > 0 {
-        lsp_spans.push(Span::styled(format!("▲ {warnings}  "), bar.fg(th.warning)));
+        lsp.push((format!("▲ {warnings}  "), bar.fg(th.warning)));
     }
     if let Some((name, ready)) = app.lsp.as_ref().and_then(|l| l.label()) {
         let text = if ready { format!("{name}  ") } else { format!("{name}…  ") };
-        lsp_spans.push(Span::styled(text, bar.fg(if ready { th.accent } else { th.dim })));
+        lsp.push((text, bar.fg(if ready { th.accent } else { th.dim })));
     }
-    let used: usize = lsp_spans.iter().chain(left.iter()).map(|s| s.content.chars().count()).sum();
-    let pad = (area.width as usize).saturating_sub(used + right.chars().count());
-    left.push(Span::styled(" ".repeat(pad), bar));
-    left.extend(lsp_spans);
-    left.push(Span::styled(right, bar.fg(th.dim)));
-    f.render_widget(Paragraph::new(Line::from(left)).style(bar), area);
+    lsp.push((right, bar.fg(th.dim)));
+    let spans: Vec<(&str, Style)> = left.iter().map(|(t, s)| (t.as_str(), *s)).collect();
+    scr.put_spans(area.x, area.y, &spans, area.right());
+    let right_w: usize = lsp.iter().map(|(t, _)| width_of(t)).sum();
+    let rx = area.right().saturating_sub(right_w as u16);
+    let spans: Vec<(&str, Style)> = lsp.iter().map(|(t, s)| (t.as_str(), *s)).collect();
+    scr.put_spans(rx, area.y, &spans, area.right());
 }
 
-fn draw_bottom(f: &mut Frame, app: &App, area: Rect) {
+fn draw_bottom(scr: &mut Screen, app: &App, area: Rect) {
     let th = app.theme;
-    let key = Style::default().fg(th.warning);
-    let dim = Style::default().fg(th.dim);
-    let line = match &app.prompt {
+    let key = fg(th.warning);
+    let dim = fg(th.dim);
+    let right = area.right();
+    match &app.prompt {
         Some(Prompt::Unsaved(after)) => {
             let name = app.buf.as_ref().and_then(|b| b.path.as_ref()).map_or("file".into(), |p| app.rel(p));
             let then = match after {
@@ -338,37 +327,36 @@ fn draw_bottom(f: &mut Frame, app: &App, area: Rect) {
                 After::Close => "closing",
                 After::Open(_) => "switching",
             };
-            Line::from(vec![
-                Span::styled(format!(" Save changes to {name} before {then}? "), Style::default().fg(th.warning).add_modifier(Modifier::BOLD)),
-                Span::styled("y", key), Span::styled(" save  ", dim),
-                Span::styled("n", key), Span::styled(" discard  ", dim),
-                Span::styled("Esc", key), Span::styled(" cancel", dim),
-            ])
+            let question = format!(" Save changes to {name} before {then}? ");
+            let spans = [
+                (question.as_str(), fg(th.warning).bold()),
+                ("y", key),
+                (" save  ", dim),
+                ("n", key),
+                (" discard  ", dim),
+                ("Esc", key),
+                (" cancel", dim),
+            ];
+            scr.put_spans(area.x, area.y, &spans, right);
         }
         Some(Prompt::Find(q)) => {
-            f.set_cursor_position((area.x + 7 + q.chars().count() as u16, area.y));
-            Line::from(vec![
-                Span::styled(" Find: ", key),
-                Span::styled(q.clone(), Style::default().fg(th.text)),
-                Span::styled("   Enter next · Esc close", dim),
-            ])
+            scr.set_cursor(area.x + 7 + q.chars().count() as u16, area.y);
+            scr.put_spans(area.x, area.y, &[(" Find: ", key), (q, fg(th.text)), ("   Enter next · Esc close", dim)], right);
         }
-        _ if !app.status.is_empty() => Line::from(Span::styled(format!(" {}", app.status), Style::default().fg(th.text))),
+        _ if !app.status.is_empty() => {
+            scr.put(area.x, area.y, &format!(" {}", app.status), fg(th.text), right);
+        }
         _ => {
             let y = app.buf.as_ref().map(|b| b.cur.y);
-            match diags(app).iter().find(|d| Some(d.line) == y) {
-                Some(d) => Line::from(Span::styled(
-                    format!(" {} {}", severity_label(d.severity), d.message),
-                    Style::default().fg(sev_color(&th, d.severity)),
-                )),
-                None => Line::from(""),
+            if let Some(d) = diags(app).iter().find(|d| Some(d.line) == y) {
+                let text = format!(" {} {}", severity_label(d.severity), d.message);
+                scr.put(area.x, area.y, &text, fg(sev_color(&th, d.severity)), right);
             }
         }
-    };
-    f.render_widget(Paragraph::new(line), area);
+    }
 }
 
-fn draw_popup(f: &mut Frame, app: &App) {
+fn draw_popup(scr: &mut Screen, app: &App) {
     let th = app.theme;
     let (Some(popup), Some(b)) = (&app.popup, &app.buf) else { return };
     let text = app.text_area;
@@ -376,20 +364,20 @@ fn draw_popup(f: &mut Frame, app: &App) {
     if b.cur.y < sy || text.width < 10 {
         return;
     }
-    let screen = f.area();
+    let screen = scr.area();
     let row = text.y + (b.cur.y - sy) as u16;
     let (title, lines, anchor_x, width) = match popup {
         Popup::Hover(info) => {
             let w = 80.min(text.width as usize).max(20);
             let inner = w - 2;
-            let mut lines = Vec::new();
+            let mut lines: Vec<Vec<(String, Style)>> = Vec::new();
             for l in info.lines() {
                 let cs: Vec<char> = l.chars().collect();
                 if cs.is_empty() {
-                    lines.push(Line::from(""));
+                    lines.push(Vec::new());
                 }
                 for chunk in cs.chunks(inner) {
-                    lines.push(Line::from(Span::styled(chunk.iter().collect::<String>(), Style::default().fg(th.text))));
+                    lines.push(vec![(chunk.iter().collect(), fg(th.text))]);
                 }
             }
             lines.truncate(14);
@@ -408,17 +396,14 @@ fn draw_popup(f: &mut Frame, app: &App) {
                 .skip(first)
                 .take(rows)
                 .map(|(i, it)| {
-                    let mut st = Style::default().fg(th.text);
+                    let mut st = fg(th.text);
                     if i == sel {
-                        st = st.bg(th.selection).fg(th.accent).add_modifier(Modifier::BOLD);
+                        st = st.bg(th.selection).fg(th.accent).bold();
                     }
                     let label: String = it.label.chars().take(label_w).collect();
                     let detail: String = it.detail.chars().take(w.saturating_sub(label_w + 5)).collect();
                     let pad = (w - 2).saturating_sub(label.chars().count() + detail.chars().count() + 2);
-                    Line::from(vec![
-                        Span::styled(format!(" {label}{}", " ".repeat(pad)), st),
-                        Span::styled(format!("{detail} "), st.fg(th.dim)),
-                    ])
+                    vec![(format!(" {label}{}", " ".repeat(pad)), st), (format!("{detail} "), st.fg(th.dim))]
                 })
                 .collect();
             (" Complete ", lines, display_col(&b.lines[start.y], start.x), w)
@@ -429,21 +414,13 @@ fn draw_popup(f: &mut Frame, app: &App) {
     let below = row + 1 + h <= screen.height.saturating_sub(2);
     let y = if below { row + 1 } else { row.saturating_sub(h) };
     let area = Rect { x, y, width: width as u16, height: h }.intersection(screen);
-    f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new(lines).block(
-            Block::bordered()
-                .border_style(Style::default().fg(th.accent))
-                .title(Span::styled(title, Style::default().fg(th.accent).add_modifier(Modifier::BOLD))),
-        ),
-        area,
-    );
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn screen_cells_stay_small() {
-        assert!(std::mem::size_of::<ratatui_core::buffer::Cell>() <= 40, "underline-color feature crept back in?");
+    scr.boxed(area, fg(th.accent), title, fg(th.accent).bold());
+    for (i, spans) in lines.iter().enumerate() {
+        let y = area.y + 1 + i as u16;
+        if y + 1 >= area.bottom() {
+            break;
+        }
+        let spans: Vec<(&str, Style)> = spans.iter().map(|(t, s)| (t.as_str(), *s)).collect();
+        scr.put_spans(area.x + 1, y, &spans, area.right().saturating_sub(1));
     }
 }

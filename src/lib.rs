@@ -5,6 +5,7 @@ pub mod highlight;
 pub mod icons;
 pub mod lsp;
 pub mod plugin;
+pub mod screen;
 pub mod theme;
 pub mod tree;
 pub mod ui;
