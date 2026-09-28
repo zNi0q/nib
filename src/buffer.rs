@@ -262,6 +262,15 @@ impl Buffer {
         text
     }
 
+    /// Replace the text between `a` and `b` (a <= b) with `text`.
+    pub fn replace(&mut self, a: Pos, b: Pos, text: &str) {
+        if a < b {
+            self.delete(a, b);
+        }
+        self.set_cur(a);
+        self.insert(text);
+    }
+
     pub fn undo(&mut self) -> bool {
         let Some(e) = self.undo.pop() else { return false };
         match e.kind {

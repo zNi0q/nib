@@ -9,7 +9,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{After, App, Focus, Prompt};
+use crate::app::{severity_label, After, App, Focus, Popup, Prompt};
+use crate::lsp::{Diag, Severity};
 use crate::buffer::{char_width, display_col};
 use crate::highlight::{highlight_line, lang_for, Tok};
 use crate::icons::{self, icon_for};
@@ -20,6 +21,31 @@ const ACCENT: Color = Color::Rgb(122, 162, 247);
 const BAR_BG: Color = Color::Rgb(36, 40, 59);
 const SEL_BG: Color = Color::Rgb(41, 46, 66);
 const WARN: Color = Color::Rgb(224, 175, 104);
+const ERR: Color = Color::Rgb(247, 118, 142);
+
+fn sev_color(s: Severity) -> Color {
+    match s {
+        Severity::Error => ERR,
+        Severity::Warning => WARN,
+        _ => ACCENT,
+    }
+}
+
+fn sev_mark(s: Severity) -> &'static str {
+    match s {
+        Severity::Error => "●",
+        Severity::Warning => "▲",
+        _ => "·",
+    }
+}
+
+/// Diagnostics of the open file.
+fn diags(app: &App) -> &[Diag] {
+    match (&app.lsp, app.buf.as_ref().and_then(|b| b.path.as_ref())) {
+        (Some(l), Some(p)) => l.diags_for(p),
+        _ => &[],
+    }
+}
 
 fn tok_style(t: Tok) -> Style {
     let s = Style::default();
@@ -52,6 +78,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_bottom(f, app, bottom);
     if let Some(Prompt::Palette { query, sel }) = &app.prompt {
         draw_palette(f, query, *sel);
+    } else {
+        draw_popup(f, app);
     }
 }
 
@@ -79,7 +107,7 @@ fn draw_palette(f: &mut Frame, query: &str, sel: usize) {
     let rows = inner.height.saturating_sub(2) as usize;
     let first = sel.saturating_sub(rows.saturating_sub(1));
     for (i, c) in matches.iter().enumerate().skip(first).take(rows) {
-        let keys = c.ctrl.map(|k| format!("Ctrl+{}", k.to_ascii_uppercase())).unwrap_or_default();
+        let keys = c.shortcut();
         let pad = (inner.width as usize).saturating_sub(c.name.chars().count() + keys.len() + 3);
         let mut style = Style::default().fg(FG);
         if i == sel {
@@ -168,15 +196,27 @@ fn draw_editor(f: &mut Frame, app: &mut App, area: Rect) {
     let lang = buf.path.as_deref().and_then(lang_for);
     let (sy, sx) = app.scroll;
 
+    let end = (sy + area.height as usize).min(buf.lines.len());
+    // Worst diagnostic per visible line.
+    let mut marks: Vec<Option<Severity>> = vec![None; end - sy];
+    for d in diags(app).iter().filter(|d| d.line >= sy && d.line < end) {
+        let m = &mut marks[d.line - sy];
+        *m = Some(m.map_or(d.severity, |s| s.min(d.severity)));
+    }
     let mut gut = Vec::new();
     let mut rows = Vec::new();
-    for y in sy..(sy + area.height as usize).min(buf.lines.len()) {
+    for y in sy..end {
         let line = &buf.lines[y];
         let current = y == buf.cur.y;
-        gut.push(Line::from(Span::styled(
-            format!("{:>digits$}  ", y + 1),
-            if current { Style::default().fg(WARN) } else { Style::default().fg(DIM) },
-        )));
+        let (mark, mark_style) = match marks[y - sy] {
+            Some(sev) => (sev_mark(sev), Style::default().fg(sev_color(sev))),
+            None => (" ", Style::default()),
+        };
+        gut.push(Line::from(vec![
+            Span::styled(format!("{:>digits$}", y + 1), if current { Style::default().fg(WARN) } else { Style::default().fg(DIM) }),
+            Span::styled(mark, mark_style),
+            Span::raw(" "),
+        ]));
         let toks = match lang {
             Some(l) => highlight_line(line, l, &mut states.get(y).copied().unwrap_or_default()),
             None => vec![Tok::Text; line.chars().count()],
@@ -270,9 +310,26 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         );
     }
     left.push(Span::styled("  ^P commands", bar.fg(DIM)));
-    let used: usize = left.iter().map(|s| s.content.chars().count()).sum();
+    let (errors, warnings) = diags(app).iter().fold((0, 0), |(e, w), d| match d.severity {
+        Severity::Error => (e + 1, w),
+        Severity::Warning => (e, w + 1),
+        _ => (e, w),
+    });
+    let mut lsp_spans = Vec::new();
+    if errors > 0 {
+        lsp_spans.push(Span::styled(format!("✖ {errors}  "), bar.fg(ERR)));
+    }
+    if warnings > 0 {
+        lsp_spans.push(Span::styled(format!("▲ {warnings}  "), bar.fg(WARN)));
+    }
+    if let Some((name, ready)) = app.lsp.as_ref().and_then(|l| l.label()) {
+        let text = if ready { format!("{name}  ") } else { format!("{name}…  ") };
+        lsp_spans.push(Span::styled(text, bar.fg(if ready { ACCENT } else { DIM })));
+    }
+    let used: usize = lsp_spans.iter().chain(left.iter()).map(|s| s.content.chars().count()).sum();
     let pad = (area.width as usize).saturating_sub(used + right.chars().count());
     left.push(Span::styled(" ".repeat(pad), bar));
+    left.extend(lsp_spans);
     left.push(Span::styled(right, bar.fg(DIM)));
     f.render_widget(Paragraph::new(Line::from(left)).style(bar), area);
 }
@@ -303,7 +360,90 @@ fn draw_bottom(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled("   Enter next · Esc close", dim),
             ])
         }
-        _ => Line::from(Span::styled(format!(" {}", app.status), Style::default().fg(FG))),
+        _ if !app.status.is_empty() => Line::from(Span::styled(format!(" {}", app.status), Style::default().fg(FG))),
+        _ => {
+            // Problem on the cursor line, if any.
+            let y = app.buf.as_ref().map(|b| b.cur.y);
+            match diags(app).iter().find(|d| Some(d.line) == y) {
+                Some(d) => Line::from(Span::styled(
+                    format!(" {} {}", severity_label(d.severity), d.message),
+                    Style::default().fg(sev_color(d.severity)),
+                )),
+                None => Line::from(""),
+            }
+        }
     };
     f.render_widget(Paragraph::new(line), area);
+}
+
+/// Hover info or the completion list, next to the cursor.
+fn draw_popup(f: &mut Frame, app: &App) {
+    let (Some(popup), Some(b)) = (&app.popup, &app.buf) else { return };
+    let text = app.text_area;
+    let (sy, sx) = app.scroll;
+    if b.cur.y < sy || text.width < 10 {
+        return;
+    }
+    let screen = f.area();
+    let row = text.y + (b.cur.y - sy) as u16;
+    let (title, lines, anchor_x, width) = match popup {
+        Popup::Hover(info) => {
+            let w = 80.min(text.width as usize).max(20);
+            let inner = w - 2;
+            let mut lines = Vec::new();
+            for l in info.lines() {
+                let cs: Vec<char> = l.chars().collect();
+                if cs.is_empty() {
+                    lines.push(Line::from(""));
+                }
+                for chunk in cs.chunks(inner) {
+                    lines.push(Line::from(Span::styled(chunk.iter().collect::<String>(), Style::default().fg(FG))));
+                }
+            }
+            lines.truncate(14);
+            (" Info ", lines, display_col(&b.lines[b.cur.y], b.cur.x), w)
+        }
+        Popup::Complete { .. } => {
+            let Some((items, sel, start)) = app.completion_view() else { return };
+            let label_w = items.iter().map(|i| i.label.chars().count()).max().unwrap_or(1).min(40);
+            let detail_w = items.iter().map(|i| i.detail.chars().count()).max().unwrap_or(0).min(30);
+            let w = (label_w + detail_w + 5).min(text.width as usize).max(16);
+            let rows = 10;
+            let first = sel.saturating_sub(rows - 1);
+            let lines = items
+                .iter()
+                .enumerate()
+                .skip(first)
+                .take(rows)
+                .map(|(i, it)| {
+                    let mut st = Style::default().fg(FG);
+                    if i == sel {
+                        st = st.bg(SEL_BG).fg(ACCENT).add_modifier(Modifier::BOLD);
+                    }
+                    let label: String = it.label.chars().take(label_w).collect();
+                    let detail: String = it.detail.chars().take(w.saturating_sub(label_w + 5)).collect();
+                    let pad = (w - 2).saturating_sub(label.chars().count() + detail.chars().count() + 2);
+                    Line::from(vec![
+                        Span::styled(format!(" {label}{}", " ".repeat(pad)), st),
+                        Span::styled(format!("{detail} "), st.fg(DIM)),
+                    ])
+                })
+                .collect();
+            (" Complete ", lines, display_col(&b.lines[start.y], start.x), w)
+        }
+    };
+    let h = lines.len() as u16 + 2;
+    let x = (text.x + anchor_x.saturating_sub(sx) as u16).min(screen.width.saturating_sub(width as u16));
+    let below = row + 1 + h <= screen.height.saturating_sub(2);
+    let y = if below { row + 1 } else { row.saturating_sub(h) };
+    let area = Rect { x, y, width: width as u16, height: h }.intersection(screen);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_style(Style::default().fg(ACCENT))
+                .title(Span::styled(title, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
+        ),
+        area,
+    );
 }

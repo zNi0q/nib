@@ -1,5 +1,7 @@
 use std::io::stdout;
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::time::Instant;
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange,
@@ -7,6 +9,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use nib::app::App;
+use nib::lsp::{Lsp, Wake};
 
 const HELP: &str = "nib — a small terminal code editor
 
@@ -14,10 +17,15 @@ usage: nib [folder | file]
 
   nib            open the current folder
   nib <folder>   open a folder in the file tree
-  nib <file>     open a file (creates it on first save if missing)";
+  nib <file>     open a file (creates it on first save if missing)
+  nib plugin     manage language-server plugins (list, add, new, remove)";
 
 fn main() -> std::io::Result<()> {
-    let arg = std::env::args().nth(1);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("plugin") {
+        std::process::exit(nib::plugin::cli(&args[1..]));
+    }
+    let arg = args.first().cloned();
     match arg.as_deref() {
         Some("-h" | "--help") => {
             println!("{HELP}");
@@ -38,21 +46,50 @@ fn main() -> std::io::Result<()> {
 
     let mut term = ratatui::init();
     execute!(stdout(), EnableMouseCapture, EnableBracketedPaste, EnableFocusChange)?;
+
+    // Keyboard input and language-server messages arrive on one channel, so
+    // the loop sleeps until something happens (or a timer is due).
+    let (tx, rx) = mpsc::channel();
+    let input = tx.clone();
+    std::thread::spawn(move || {
+        while let Ok(ev) = event::read() {
+            if input.send(Wake::Term(ev)).is_err() {
+                break;
+            }
+        }
+    });
+    let (plugins, warnings) = nib::plugin::load();
+    app.attach_lsp(Lsp::new(plugins, tx));
+    if let Some(w) = warnings.first() {
+        app.status = w.clone();
+    }
+
     let res = (|| -> std::io::Result<()> {
         while !app.quit {
             term.draw(|f| nib::ui::draw(f, &mut app))?;
-            // Block until input; only wake on a timer when an auto-save is pending.
-            let ready = match app.autosave_wait() {
-                Some(wait) => event::poll(wait)?,
-                None => true,
+            let first = match app.next_wake() {
+                Some(t) => match rx.recv_timeout(t.saturating_duration_since(Instant::now())) {
+                    Ok(w) => Some(w),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                },
+                None => match rx.recv() {
+                    Ok(w) => Some(w),
+                    Err(_) => break,
+                },
             };
-            if ready {
-                match event::read()? {
-                    Event::Key(k) if k.kind != KeyEventKind::Release => app.on_key(k),
-                    Event::Paste(s) => app.on_paste(&s),
-                    Event::Mouse(m) => app.on_mouse(m),
-                    Event::FocusLost => app.flush(),
-                    _ => {}
+            // Handle everything already queued before redrawing once.
+            for w in first.into_iter().chain(std::iter::from_fn(|| rx.try_recv().ok())) {
+                match w {
+                    Wake::Term(Event::Key(k)) if k.kind != KeyEventKind::Release => app.on_key(k),
+                    Wake::Term(Event::Paste(s)) => app.on_paste(&s),
+                    Wake::Term(Event::Mouse(m)) => app.on_mouse(m),
+                    Wake::Term(Event::FocusLost) => app.flush(),
+                    Wake::Term(_) => {}
+                    Wake::Lsp(id, msg) => app.on_lsp(id, msg),
+                }
+                if app.quit {
+                    break;
                 }
             }
             app.tick();
@@ -61,6 +98,8 @@ fn main() -> std::io::Result<()> {
     })();
     // Never lose edits, even if the terminal went away.
     app.flush();
+    // Dropping the client kills every server right away.
+    app.lsp = None;
     let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste, DisableFocusChange);
     ratatui::restore();
     res

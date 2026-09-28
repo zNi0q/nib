@@ -9,6 +9,7 @@ use ratatui::layout::Rect;
 
 use crate::buffer::{char_at_col, display_col, Buffer, Pos};
 use crate::highlight::{highlight_line, lang_for, State};
+use crate::lsp::{char_from_utf16, Item, Lsp, Reply, Severity};
 use crate::tree::Tree;
 
 /// Auto-save runs this long after the last edit.
@@ -51,31 +52,73 @@ pub enum Cmd {
     SwitchFocus,
     Refresh,
     ToggleAutosave,
+    Definition,
+    Back,
+    Hover,
+    Complete,
+    NextProblem,
+    LspStatus,
+    LspRestart,
 }
 
 pub struct Command {
     pub name: &'static str,
     /// Ctrl+<key> shortcut, if any.
     pub ctrl: Option<char>,
+    /// Other shortcut, for display (handled in `handle_key`).
+    pub key: Option<&'static str>,
     pub cmd: Cmd,
+}
+
+impl Command {
+    pub fn shortcut(&self) -> String {
+        match (self.ctrl, self.key) {
+            (Some(' '), _) => "Ctrl+Space".into(),
+            (Some(c), _) => format!("Ctrl+{}", c.to_ascii_uppercase()),
+            (None, Some(k)) => k.into(),
+            (None, None) => String::new(),
+        }
+    }
 }
 
 /// Every action, in the order the palette lists them.
 pub const COMMANDS: &[Command] = &[
-    Command { name: "Save file", ctrl: Some('s'), cmd: Cmd::Save },
-    Command { name: "Find in file", ctrl: Some('f'), cmd: Cmd::Find },
-    Command { name: "Undo", ctrl: Some('z'), cmd: Cmd::Undo },
-    Command { name: "Redo", ctrl: Some('y'), cmd: Cmd::Redo },
-    Command { name: "Cut line", ctrl: Some('k'), cmd: Cmd::CutLine },
-    Command { name: "Paste line", ctrl: Some('u'), cmd: Cmd::PasteLine },
-    Command { name: "Switch tree / editor", ctrl: Some('e'), cmd: Cmd::SwitchFocus },
-    Command { name: "Toggle sidebar", ctrl: Some('b'), cmd: Cmd::ToggleSidebar },
-    Command { name: "Refresh file tree", ctrl: Some('r'), cmd: Cmd::Refresh },
-    Command { name: "Toggle auto-save", ctrl: None, cmd: Cmd::ToggleAutosave },
-    Command { name: "Close file", ctrl: Some('w'), cmd: Cmd::Close },
-    Command { name: "Quit nib", ctrl: Some('q'), cmd: Cmd::Quit },
-    Command { name: "Command palette", ctrl: Some('p'), cmd: Cmd::Palette },
+    Command { name: "Save file", ctrl: Some('s'), key: None, cmd: Cmd::Save },
+    Command { name: "Find in file", ctrl: Some('f'), key: None, cmd: Cmd::Find },
+    Command { name: "Go to definition", ctrl: None, key: Some("F12"), cmd: Cmd::Definition },
+    Command { name: "Go back", ctrl: None, key: Some("Alt+←"), cmd: Cmd::Back },
+    Command { name: "Show hover info", ctrl: None, key: Some("F1"), cmd: Cmd::Hover },
+    Command { name: "Complete", ctrl: Some(' '), key: None, cmd: Cmd::Complete },
+    Command { name: "Next problem", ctrl: None, key: Some("F8"), cmd: Cmd::NextProblem },
+    Command { name: "Undo", ctrl: Some('z'), key: None, cmd: Cmd::Undo },
+    Command { name: "Redo", ctrl: Some('y'), key: None, cmd: Cmd::Redo },
+    Command { name: "Cut line", ctrl: Some('k'), key: None, cmd: Cmd::CutLine },
+    Command { name: "Paste line", ctrl: Some('u'), key: None, cmd: Cmd::PasteLine },
+    Command { name: "Switch tree / editor", ctrl: Some('e'), key: None, cmd: Cmd::SwitchFocus },
+    Command { name: "Toggle sidebar", ctrl: Some('b'), key: None, cmd: Cmd::ToggleSidebar },
+    Command { name: "Refresh file tree", ctrl: Some('r'), key: None, cmd: Cmd::Refresh },
+    Command { name: "Toggle auto-save", ctrl: None, key: None, cmd: Cmd::ToggleAutosave },
+    Command { name: "LSP: status", ctrl: None, key: None, cmd: Cmd::LspStatus },
+    Command { name: "LSP: restart servers", ctrl: None, key: None, cmd: Cmd::LspRestart },
+    Command { name: "Close file", ctrl: Some('w'), key: None, cmd: Cmd::Close },
+    Command { name: "Quit nib", ctrl: Some('q'), key: None, cmd: Cmd::Quit },
+    Command { name: "Command palette", ctrl: Some('p'), key: None, cmd: Cmd::Palette },
 ];
+
+/// A small floating window over the editor.
+pub enum Popup {
+    Hover(String),
+    /// Completion list; `start` is where the typed prefix begins.
+    Complete { items: Vec<Item>, sel: usize, start: Pos },
+}
+
+/// Where to put the cursor once a file opens.
+#[derive(Clone, Copy)]
+enum Target {
+    Char(Pos),
+    /// Line and UTF-16 column, as LSP servers send them.
+    Utf16(usize, usize),
+}
 
 pub struct App {
     pub tree: Tree,
@@ -100,6 +143,14 @@ pub struct App {
     /// Highlighter state at the start of each line, for buffer `states_version`.
     states: Vec<State>,
     states_version: Option<u64>,
+    /// Language servers (None until `attach_lsp`, e.g. in unit tests).
+    pub lsp: Option<Lsp>,
+    pub popup: Option<Popup>,
+    /// Positions to return to with "Go back".
+    jumps: Vec<(PathBuf, Pos)>,
+    pending_cursor: Option<(PathBuf, Target)>,
+    /// Where a requested completion's prefix starts.
+    complete_start: Option<Pos>,
 }
 
 impl App {
@@ -129,6 +180,11 @@ impl App {
             last_find: String::new(),
             states: Vec::new(),
             states_version: None,
+            lsp: None,
+            popup: None,
+            jumps: Vec::new(),
+            pending_cursor: None,
+            complete_start: None,
         };
         if let Some(f) = file {
             if f.exists() {
@@ -180,14 +236,40 @@ impl App {
         &self.states
     }
 
+    /// Start language-server support and register the already-open file.
+    pub fn attach_lsp(&mut self, mut lsp: Lsp) {
+        if let Some(b) = &self.buf {
+            if let Some(p) = &b.path {
+                if let Some(msg) = lsp.open(p, &b.text()) {
+                    self.status = msg;
+                }
+            }
+        }
+        self.lsp = Some(lsp);
+    }
+
     fn open(&mut self, path: &Path) {
         match Buffer::open(path) {
-            Ok(b) => {
+            Ok(mut b) => {
+                if let Some((p, t)) = self.pending_cursor.take() {
+                    if p == path {
+                        let pos = match t {
+                            Target::Char(pos) => pos,
+                            Target::Utf16(y, c) => {
+                                let y = y.min(b.lines.len() - 1);
+                                Pos { y, x: char_from_utf16(&b.lines[y], c) }
+                            }
+                        };
+                        b.set_cur(pos);
+                    }
+                }
+                self.popup = None;
+                let lsp_msg = self.lsp.as_mut().and_then(|l| l.open(path, &b.text()));
                 self.buf = Some(b);
                 self.states_version = None;
                 self.scroll = (0, 0);
                 self.focus = Focus::Editor;
-                self.status = format!("Opened {}", self.rel(path));
+                self.status = lsp_msg.unwrap_or_else(|| format!("Opened {}", self.rel(path)));
             }
             Err(e) => self.status = format!("Can't open {}: {e}", self.rel(path)),
         }
@@ -200,6 +282,9 @@ impl App {
         match self.buf.as_mut().unwrap().save() {
             Ok(()) => {
                 self.status = format!("Saved {name}");
+                if let (Some(l), Some(b)) = (self.lsp.as_mut(), self.buf.as_ref()) {
+                    l.saved(b);
+                }
                 if is_new {
                     self.tree.refresh();
                 }
@@ -225,6 +310,10 @@ impl App {
         match after {
             After::Quit => self.quit = true,
             After::Close => {
+                if let Some(l) = self.lsp.as_mut() {
+                    l.close();
+                }
+                self.popup = None;
                 self.buf = None;
                 self.focus = Focus::Tree;
                 self.show_tree = true;
@@ -247,7 +336,11 @@ impl App {
     }
 
     pub fn exec(&mut self, cmd: Cmd) {
-        let needs_file = matches!(cmd, Cmd::Close | Cmd::Find | Cmd::Undo | Cmd::Redo | Cmd::CutLine | Cmd::PasteLine);
+        let needs_file = matches!(
+            cmd,
+            Cmd::Close | Cmd::Find | Cmd::Undo | Cmd::Redo | Cmd::CutLine | Cmd::PasteLine
+                | Cmd::Definition | Cmd::Hover | Cmd::Complete | Cmd::NextProblem
+        );
         if needs_file && self.buf.is_none() {
             self.status = "Open a file first".into();
             return;
@@ -280,6 +373,36 @@ impl App {
                 };
             }
             Cmd::Refresh => { self.tree.refresh(); self.status = "Refreshed file tree".into(); }
+            Cmd::Definition | Cmd::Hover | Cmd::Complete => {
+                let (Some(lsp), Some(b)) = (self.lsp.as_mut(), self.buf.as_ref()) else {
+                    self.status = "No language server for this file (see `nib plugin list`)".into();
+                    return;
+                };
+                let res = match cmd {
+                    Cmd::Definition => lsp.definition(b),
+                    Cmd::Hover => lsp.hover(b),
+                    _ => {
+                        self.complete_start = Some(word_start(b));
+                        lsp.completion(b)
+                    }
+                };
+                if let Err(e) = res {
+                    self.status = e;
+                }
+            }
+            Cmd::Back => match self.jumps.pop() {
+                Some((path, pos)) => self.goto(path, Target::Char(pos)),
+                None => self.status = "No earlier position".into(),
+            },
+            Cmd::NextProblem => self.next_problem(),
+            Cmd::LspStatus => {
+                self.status = self.lsp.as_ref().map_or("LSP: no servers running".into(), |l| l.status());
+            }
+            Cmd::LspRestart => {
+                if let Some(l) = self.lsp.as_mut() {
+                    self.status = l.restart(self.buf.as_ref()).unwrap_or_default();
+                }
+            }
             Cmd::ToggleAutosave => {
                 self.autosave = !self.autosave;
                 self.status = format!("Auto-save {}", if self.autosave { "on" } else { "off" });
@@ -293,8 +416,163 @@ impl App {
 
     /// Restart the auto-save countdown if the last input changed the text.
     fn note_edit(&mut self, before: Option<u64>) {
-        if self.version() != before && self.buf.as_ref().is_some_and(|b| b.dirty) {
-            self.last_edit = Some(Instant::now());
+        if self.version() != before {
+            if self.buf.as_ref().is_some_and(|b| b.dirty) {
+                self.last_edit = Some(Instant::now());
+            }
+            if let Some(l) = self.lsp.as_mut() {
+                l.changed();
+            }
+        }
+    }
+
+    /// When the main loop must wake up even without input.
+    pub fn next_wake(&self) -> Option<Instant> {
+        let save = self.autosave_wait().map(|d| Instant::now() + d);
+        let lsp = self.lsp.as_ref().and_then(Lsp::deadline);
+        save.into_iter().chain(lsp).min()
+    }
+
+    /// A message (or exit) from language server `id`.
+    pub fn on_lsp(&mut self, id: usize, msg: Option<serde_json::Value>) {
+        let Some(reply) = self.lsp.as_mut().and_then(|l| l.handle(id, msg)) else { return };
+        match reply {
+            Reply::Message(m) => self.status = m,
+            Reply::Hover(text) if text.is_empty() => self.status = "No info here".into(),
+            Reply::Hover(text) => {
+                if self.buf.is_some() && self.focus == Focus::Editor {
+                    self.popup = Some(Popup::Hover(text));
+                }
+            }
+            Reply::Definition(locs) => match locs.into_iter().next() {
+                None => self.status = "No definition found".into(),
+                Some(loc) => {
+                    if let Some(p) = self.buf.as_ref().and_then(|b| b.path.clone()) {
+                        self.jumps.push((p, self.buf.as_ref().unwrap().cur));
+                        if self.jumps.len() > 100 {
+                            self.jumps.remove(0);
+                        }
+                    }
+                    self.goto(loc.path, Target::Utf16(loc.line, loc.col16));
+                }
+            },
+            Reply::Completion(items) => {
+                let (Some(start), Some(b)) = (self.complete_start.take(), self.buf.as_ref()) else { return };
+                if b.cur.y != start.y || b.cur.x < start.x || self.focus != Focus::Editor {
+                    return;
+                }
+                if items.is_empty() {
+                    self.status = "No completions".into();
+                } else {
+                    self.popup = Some(Popup::Complete { items, sel: 0, start });
+                    self.refilter();
+                }
+            }
+        }
+    }
+
+    /// Move to a position, opening the file if needed.
+    fn goto(&mut self, path: PathBuf, t: Target) {
+        let same = self.buf.as_ref().and_then(|b| b.path.as_ref()) == Some(&path);
+        if same {
+            let b = self.buf.as_mut().unwrap();
+            let pos = match t {
+                Target::Char(p) => p,
+                Target::Utf16(y, c) => {
+                    let y = y.min(b.lines.len() - 1);
+                    Pos { y, x: char_from_utf16(&b.lines[y], c) }
+                }
+            };
+            b.set_cur(pos);
+            self.focus = Focus::Editor;
+        } else {
+            self.pending_cursor = Some((path.clone(), t));
+            self.tree.reveal(&path);
+            self.request(After::Open(path));
+        }
+    }
+
+    fn next_problem(&mut self) {
+        let (Some(lsp), Some(b)) = (self.lsp.as_ref(), self.buf.as_mut()) else { return };
+        let Some(path) = b.path.as_ref() else { return };
+        let diags = lsp.diags_for(path);
+        let here = (b.cur.y, crate::lsp::utf16_col(&b.lines[b.cur.y], b.cur.x));
+        let Some(d) = diags.iter().find(|d| (d.line, d.col16) > here).or(diags.first()) else {
+            self.status = "No problems".into();
+            return;
+        };
+        let y = d.line.min(b.lines.len() - 1);
+        b.set_cur(Pos { y, x: char_from_utf16(&b.lines[y], d.col16) });
+        self.status = format!("{} {}", severity_label(d.severity), d.message);
+    }
+
+    /// Completion items matching the typed prefix, and the selected index.
+    pub fn completion_view(&self) -> Option<(Vec<&Item>, usize, Pos)> {
+        let Some(Popup::Complete { items, sel, start }) = &self.popup else { return None };
+        let b = self.buf.as_ref()?;
+        let line = &b.lines[start.y];
+        let prefix: String = line.chars().skip(start.x).take(b.cur.x.saturating_sub(start.x)).collect::<String>().to_lowercase();
+        let mut v: Vec<&Item> = items.iter().filter(|i| i.filter.to_lowercase().starts_with(&prefix)).collect();
+        if v.is_empty() {
+            v = items.iter().filter(|i| i.filter.to_lowercase().contains(&prefix)).collect();
+        }
+        Some((v, *sel, *start))
+    }
+
+    /// Close the completion popup if the cursor left the word or nothing matches.
+    fn refilter(&mut self) {
+        let Some((view, sel, start)) = self.completion_view() else { return };
+        let b = self.buf.as_ref().unwrap();
+        let n = view.len();
+        if n == 0 || b.cur.y != start.y || b.cur.x < start.x {
+            self.popup = None;
+        } else if sel >= n {
+            if let Some(Popup::Complete { sel, .. }) = &mut self.popup {
+                *sel = n - 1;
+            }
+        }
+    }
+
+    fn accept_completion(&mut self) {
+        let Some((view, sel, start)) = self.completion_view() else { return };
+        let Some(item) = view.get(sel).map(|i| (*i).clone()) else { return };
+        self.popup = None;
+        let b = self.buf.as_mut().unwrap();
+        let from = match item.edit_start {
+            Some((y, c)) if y == b.cur.y => Pos { y, x: char_from_utf16(&b.lines[y], c).min(b.cur.x) },
+            _ => start,
+        };
+        b.replace(from, b.cur, &item.insert);
+    }
+
+    /// Keys while a popup is open. Returns true if the key was consumed.
+    fn popup_key(&mut self, k: KeyEvent) -> bool {
+        match &mut self.popup {
+            None => false,
+            Some(Popup::Hover(_)) => {
+                self.popup = None;
+                k.code == KeyCode::Esc
+            }
+            Some(Popup::Complete { sel, .. }) => match k.code {
+                KeyCode::Esc => {
+                    self.popup = None;
+                    true
+                }
+                KeyCode::Up => {
+                    *sel = sel.saturating_sub(1);
+                    true
+                }
+                KeyCode::Down => {
+                    *sel += 1;
+                    self.refilter();
+                    true
+                }
+                KeyCode::Enter | KeyCode::Tab => {
+                    self.accept_completion();
+                    true
+                }
+                _ => false,
+            },
         }
     }
 
@@ -312,6 +590,9 @@ impl App {
     pub fn tick(&mut self) {
         if self.autosave_wait() == Some(Duration::ZERO) {
             self.flush();
+        }
+        if let Some(l) = self.lsp.as_mut() {
+            l.tick(self.buf.as_ref());
         }
     }
 
@@ -339,6 +620,16 @@ impl App {
         if self.prompt.is_some() {
             return self.on_prompt_key(k);
         }
+        if self.popup_key(k) {
+            return;
+        }
+        match k.code {
+            KeyCode::F(12) => return self.exec(Cmd::Definition),
+            KeyCode::F(1) => return self.exec(Cmd::Hover),
+            KeyCode::F(8) => return self.exec(Cmd::NextProblem),
+            KeyCode::Left if k.modifiers.contains(KeyModifiers::ALT) => return self.exec(Cmd::Back),
+            _ => {}
+        }
         if k.modifiers.contains(KeyModifiers::CONTROL) {
             if let KeyCode::Char(c) = k.code {
                 if let Some(cmd) = COMMANDS.iter().find(|cmd| cmd.ctrl == Some(c)) {
@@ -352,7 +643,16 @@ impl App {
         }
         match self.focus {
             Focus::Tree => self.tree_key(k),
-            Focus::Editor => self.editor_key(k),
+            Focus::Editor => {
+                self.editor_key(k);
+                self.refilter();
+                if let KeyCode::Char(c) = k.code {
+                    let typed = !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+                    if typed && self.lsp.as_ref().is_some_and(|l| l.is_trigger(c)) {
+                        self.exec(Cmd::Complete);
+                    }
+                }
+            }
         }
     }
 
@@ -543,6 +843,25 @@ impl App {
         if col < sx { sx = col }
         if col >= sx + w { sx = col + 1 - w }
         self.scroll = (sy, sx);
+    }
+}
+
+/// Start of the identifier the cursor is in or just after.
+fn word_start(b: &Buffer) -> Pos {
+    let cs: Vec<char> = b.lines[b.cur.y].chars().collect();
+    let mut x = b.cur.x.min(cs.len());
+    while x > 0 && (cs[x - 1].is_alphanumeric() || cs[x - 1] == '_' || cs[x - 1] == '$') {
+        x -= 1;
+    }
+    Pos { y: b.cur.y, x }
+}
+
+pub fn severity_label(s: Severity) -> &'static str {
+    match s {
+        Severity::Error => "● error:",
+        Severity::Warning => "▲ warning:",
+        Severity::Info => "· info:",
+        Severity::Hint => "· hint:",
     }
 }
 
