@@ -2,7 +2,8 @@ use std::io::stdout;
 use std::path::PathBuf;
 
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, KeyEventKind,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange,
+    EnableMouseCapture, Event, KeyEventKind,
 };
 use crossterm::execute;
 use nib::app::App;
@@ -36,20 +37,31 @@ fn main() -> std::io::Result<()> {
     let mut app = App::new(&path);
 
     let mut term = ratatui::init();
-    execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+    execute!(stdout(), EnableMouseCapture, EnableBracketedPaste, EnableFocusChange)?;
     let res = (|| -> std::io::Result<()> {
         while !app.quit {
             term.draw(|f| nib::ui::draw(f, &mut app))?;
-            match event::read()? {
-                Event::Key(k) if k.kind != KeyEventKind::Release => app.on_key(k),
-                Event::Paste(s) => app.on_paste(&s),
-                Event::Mouse(m) => app.on_mouse(m),
-                _ => {}
+            // Block until input; only wake on a timer when an auto-save is pending.
+            let ready = match app.autosave_wait() {
+                Some(wait) => event::poll(wait)?,
+                None => true,
+            };
+            if ready {
+                match event::read()? {
+                    Event::Key(k) if k.kind != KeyEventKind::Release => app.on_key(k),
+                    Event::Paste(s) => app.on_paste(&s),
+                    Event::Mouse(m) => app.on_mouse(m),
+                    Event::FocusLost => app.flush(),
+                    _ => {}
+                }
             }
+            app.tick();
         }
         Ok(())
     })();
-    let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
+    // Never lose edits, even if the terminal went away.
+    app.flush();
+    let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste, DisableFocusChange);
     ratatui::restore();
     res
 }

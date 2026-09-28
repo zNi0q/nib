@@ -116,7 +116,7 @@ impl Drop for Tmux {
 }
 
 #[test]
-fn open_folder_edit_save_then_quit_discarding() {
+fn open_folder_edit_save_then_quit_autosaves() {
     let fx = Fixture::new("folder");
     fx.write("src/main.rs", "fn main() {}\n");
     fx.write("README.md", "# readme\n");
@@ -140,17 +140,50 @@ fn open_folder_edit_save_then_quit_discarding() {
     fx.wait_disk("src/main.rs", "// fn main() {}\n");
     assert!(!t.screen().contains("●"), "still marked modified after save:\n{}", t.screen());
 
+    // Quitting right after an edit saves it (auto-save), no prompt.
     t.literal("more");
+    t.keys(&["C-q"]);
+    t.wait_exit();
+    assert_eq!(fx.read("src/main.rs"), "// morefn main() {}\n");
+}
+
+#[test]
+fn autosaves_after_a_pause_without_ctrl_s() {
+    let fx = Fixture::new("autosave");
+    let f = fx.write("a.txt", "alpha\n");
+    let t = Tmux::start("autosave", &fx.0, &f);
+    t.wait_for("alpha");
+    t.literal("typed ");
     t.wait_for("●");
+    fx.wait_disk("a.txt", "typed alpha\n");
+    t.wait_for("Saved a.txt");
+    assert!(!t.screen().contains("●"), "still marked modified:\n{}", t.screen());
+}
+
+#[test]
+fn autosave_off_asks_before_quitting_and_n_discards() {
+    let fx = Fixture::new("noauto");
+    let f = fx.write("a.txt", "alpha\n");
+    let t = Tmux::start("noauto", &fx.0, &f);
+    t.wait_for("alpha");
+    t.keys(&["C-p"]);
+    t.wait_for(" Commands ");
+    t.literal("auto");
+    t.keys(&["Enter"]);
+    t.wait_for("Auto-save off");
+    t.literal("zz");
+    t.wait_for("zzalpha");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(fx.read("a.txt"), "alpha\n", "saved while auto-save was off");
     t.keys(&["C-q"]);
     t.wait_for("Save changes to");
     t.keys(&["n"]);
     t.wait_exit();
-    assert_eq!(fx.read("src/main.rs"), "// fn main() {}\n", "discarded edit reached disk");
+    assert_eq!(fx.read("a.txt"), "alpha\n", "discarded edit reached disk");
 }
 
 #[test]
-fn switching_files_prompts_and_y_saves() {
+fn switching_files_autosaves_without_prompt() {
     let fx = Fixture::new("switch");
     let a = fx.write("a.txt", "alpha\n");
     fx.write("b.txt", "beta\n");
@@ -163,10 +196,8 @@ fn switching_files_prompts_and_y_saves() {
     // Back to the tree (a.txt is selected), move to b.txt, open it.
     t.keys(&["Escape"]);
     t.keys(&["Down", "Enter"]);
-    t.wait_for("Save changes to");
-    assert_eq!(fx.read("a.txt"), "alpha\n", "saved before answering");
-    t.keys(&["y"]);
     fx.wait_disk("a.txt", "1alpha\n");
+    assert!(!t.screen().contains("Save changes to"), "prompted despite auto-save:\n{}", t.screen());
     t.wait_for("beta");
     assert!(!t.screen().contains("1alpha"), "old file still shown:\n{}", t.screen());
     fx.wait_disk("b.txt", "beta\n");
