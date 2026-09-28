@@ -12,6 +12,7 @@ use ratatui::{
 use crate::app::{After, App, Focus, Prompt};
 use crate::buffer::{char_width, display_col};
 use crate::highlight::{highlight_line, lang_for, Tok};
+use crate::icons::{self, icon_for};
 
 const FG: Color = Color::Rgb(192, 202, 245);
 const DIM: Color = Color::Rgb(86, 95, 137);
@@ -108,6 +109,7 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
     app.follow_cursor();
 
     let open = app.buf.as_ref().and_then(|b| b.path.clone());
+    let show_icons = icons::enabled();
     let lines: Vec<Line> = app
         .tree
         .items
@@ -116,23 +118,36 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
         .skip(app.tree.scroll)
         .take(list.height as usize)
         .map(|(i, e)| {
-            let indent = "  ".repeat(e.depth);
-            let (icon, name, style) = if e.is_dir {
+            let (chevron, name, mut style) = if e.is_dir {
                 (if e.expanded { "▾ " } else { "▸ " }, format!("{}/", e.name), Style::default().fg(ACCENT))
             } else {
                 let s = if open.as_ref() == Some(&e.path) { Style::default().fg(WARN) } else { Style::default().fg(FG) };
                 ("  ", e.name.clone(), s)
             };
-            let mut style = style;
+            let mut icon_style = style;
+            let icon = if show_icons {
+                let (glyph, color) = icon_for(&e.name, e.is_dir, e.expanded);
+                icon_style = icon_style.fg(color);
+                format!("{glyph} ")
+            } else {
+                String::new()
+            };
             if i == app.tree.sel {
                 style = style.bg(SEL_BG).add_modifier(Modifier::BOLD);
+                icon_style = icon_style.bg(SEL_BG);
                 if focused {
                     style = style.add_modifier(Modifier::REVERSED);
+                    icon_style = icon_style.add_modifier(Modifier::REVERSED);
                 }
             }
-            let text = format!(" {indent}{icon}{name}");
-            let pad = (list.width as usize).saturating_sub(text.chars().count());
-            Line::from(Span::styled(format!("{text}{}", " ".repeat(pad)), style))
+            let lead = format!(" {}{chevron}", "  ".repeat(e.depth));
+            let used = lead.chars().count() + icon.chars().count() + name.chars().count();
+            let pad = " ".repeat((list.width as usize).saturating_sub(used));
+            Line::from(vec![
+                Span::styled(lead, style),
+                Span::styled(icon, icon_style),
+                Span::styled(format!("{name}{pad}"), style),
+            ])
         })
         .collect();
     f.render_widget(Paragraph::new(lines), list);
@@ -235,6 +250,11 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let mut right = String::new();
     if let Some(b) = &app.buf {
         let name = b.path.as_ref().map_or("[no name]".into(), |p| app.rel(p));
+        if icons::enabled() {
+            let file = b.path.as_ref().and_then(|p| p.file_name()).map_or(String::new(), |n| n.to_string_lossy().into_owned());
+            let (glyph, color) = icon_for(&file, false, false);
+            left.push(Span::styled(format!(" {glyph}"), bar.fg(color)));
+        }
         left.push(Span::styled(format!(" {name}"), bar.add_modifier(Modifier::BOLD)));
         if b.dirty {
             left.push(Span::styled(" ●", bar.fg(WARN)));
