@@ -40,6 +40,8 @@ pub struct Buffer {
     pub dirty: bool,
     /// Bumped on every change; lets the UI cache per-version work.
     pub version: u64,
+    /// First line touched since the highlighter last looked (usize::MAX = none).
+    pub changed_from: usize,
     pub crlf: bool,
     trailing_newline: bool,
     /// "\t" for files already indented with tabs, otherwise spaces.
@@ -130,6 +132,7 @@ impl Buffer {
             want_col: 0,
             dirty: false,
             version: 0,
+            changed_from: usize::MAX,
             crlf,
             trailing_newline,
             indent,
@@ -192,11 +195,13 @@ impl Buffer {
         }
         self.lines[y].push_str(&tail);
         self.version += 1;
+        self.changed_from = self.changed_from.min(at.y);
         end_of(at, text)
     }
 
     fn raw_delete(&mut self, a: Pos, b: Pos) -> String {
         self.version += 1;
+        self.changed_from = self.changed_from.min(a.y);
         let ab = byte_idx(&self.lines[a.y], a.x);
         let bb = byte_idx(&self.lines[b.y], b.x);
         if a.y == b.y {

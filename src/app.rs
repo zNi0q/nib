@@ -2,13 +2,17 @@
 //! unit-tested. `ui.rs` draws it; `main.rs` feeds it events.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use crate::buffer::{char_at_col, display_col, Buffer, Pos};
-use crate::highlight::{block_states, lang_for};
+use crate::highlight::{highlight_line, lang_for, State};
 use crate::tree::Tree;
+
+/// Auto-save runs this long after the last edit.
+pub const AUTOSAVE_DELAY: Duration = Duration::from_millis(1000);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
@@ -46,6 +50,7 @@ pub enum Cmd {
     ToggleSidebar,
     SwitchFocus,
     Refresh,
+    ToggleAutosave,
 }
 
 pub struct Command {
@@ -66,6 +71,7 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "Switch tree / editor", ctrl: Some('e'), cmd: Cmd::SwitchFocus },
     Command { name: "Toggle sidebar", ctrl: Some('b'), cmd: Cmd::ToggleSidebar },
     Command { name: "Refresh file tree", ctrl: Some('r'), cmd: Cmd::Refresh },
+    Command { name: "Toggle auto-save", ctrl: None, cmd: Cmd::ToggleAutosave },
     Command { name: "Close file", ctrl: Some('w'), cmd: Cmd::Close },
     Command { name: "Quit nib", ctrl: Some('q'), cmd: Cmd::Quit },
     Command { name: "Command palette", ctrl: Some('p'), cmd: Cmd::Palette },
@@ -79,6 +85,11 @@ pub struct App {
     pub prompt: Option<Prompt>,
     pub status: String,
     pub quit: bool,
+    /// Save automatically after edits, and before switching/closing/quitting.
+    pub autosave: bool,
+    last_edit: Option<Instant>,
+    /// Buffer version whose auto-save failed; don't retry until the next edit.
+    autosave_failed: Option<u64>,
     /// First visible line and display column of the editor.
     pub scroll: (usize, usize),
     /// Screen areas from the last draw, used for mouse clicks.
@@ -86,7 +97,9 @@ pub struct App {
     pub text_area: Rect,
     clipboard: String,
     last_find: String,
-    hl_cache: Option<(u64, Vec<bool>)>,
+    /// Highlighter state at the start of each line, for buffer `states_version`.
+    states: Vec<State>,
+    states_version: Option<u64>,
 }
 
 impl App {
@@ -106,12 +119,16 @@ impl App {
             prompt: None,
             status: String::new(),
             quit: false,
+            autosave: true,
+            last_edit: None,
+            autosave_failed: None,
             scroll: (0, 0),
             tree_area: Rect::default(),
             text_area: Rect::default(),
             clipboard: String::new(),
             last_find: String::new(),
-            hl_cache: None,
+            states: Vec::new(),
+            states_version: None,
         };
         if let Some(f) = file {
             if f.exists() {
@@ -130,25 +147,44 @@ impl App {
         p.strip_prefix(&self.tree.root).unwrap_or(p).display().to_string()
     }
 
-    /// Block-comment state at the start of each line, cached per buffer version.
-    pub fn block_states(&mut self) -> &[bool] {
-        let buf = self.buf.as_ref().unwrap();
-        let fresh = matches!(&self.hl_cache, Some((v, _)) if *v == buf.version);
-        if !fresh {
-            let states = match buf.path.as_deref().and_then(lang_for) {
-                Some(lang) => block_states(&buf.lines, lang),
-                None => Vec::new(),
-            };
-            self.hl_cache = Some((buf.version, states));
+    /// Highlighter state at the start of each line. After an edit only lines
+    /// from the first changed one are redone, stopping as soon as the state
+    /// matches what it was before (so typing costs one line, not the file).
+    pub fn line_states(&mut self) -> &[State] {
+        let buf = self.buf.as_mut().unwrap();
+        let Some(lang) = buf.path.as_deref().and_then(lang_for) else {
+            self.states.clear();
+            return &self.states;
+        };
+        if self.states_version == Some(buf.version) {
+            return &self.states;
         }
-        &self.hl_cache.as_ref().unwrap().1
+        let old = std::mem::take(&mut self.states);
+        let from = if self.states_version.is_none() { 0 } else { buf.changed_from.min(old.len()) };
+        buf.changed_from = usize::MAX;
+        self.states_version = Some(buf.version);
+
+        let n = buf.lines.len();
+        let same_len = old.len() == n;
+        let mut st = old.get(from).copied().unwrap_or_default();
+        let mut states = old[..from].to_vec();
+        for y in from..n {
+            if same_len && y > from && old[y] == st {
+                states.extend_from_slice(&old[y..]);
+                break;
+            }
+            states.push(st);
+            highlight_line(&buf.lines[y], lang, &mut st);
+        }
+        self.states = states;
+        &self.states
     }
 
     fn open(&mut self, path: &Path) {
         match Buffer::open(path) {
             Ok(b) => {
                 self.buf = Some(b);
-                self.hl_cache = None;
+                self.states_version = None;
                 self.scroll = (0, 0);
                 self.focus = Focus::Editor;
                 self.status = format!("Opened {}", self.rel(path));
@@ -160,10 +196,13 @@ impl App {
     fn save(&mut self) -> bool {
         let Some(path) = self.buf.as_ref().map(|b| b.path.clone()) else { return false };
         let name = path.map(|p| self.rel(&p)).unwrap_or_default();
+        let is_new = self.buf.as_ref().unwrap().path.as_ref().is_some_and(|p| !p.exists());
         match self.buf.as_mut().unwrap().save() {
             Ok(()) => {
                 self.status = format!("Saved {name}");
-                self.tree.refresh();
+                if is_new {
+                    self.tree.refresh();
+                }
                 true
             }
             Err(e) => {
@@ -175,7 +214,7 @@ impl App {
 
     /// Run `after`, asking first if there are unsaved changes.
     fn request(&mut self, after: After) {
-        if self.buf.as_ref().is_some_and(|b| b.dirty) {
+        if self.buf.as_ref().is_some_and(|b| b.dirty) && !(self.autosave && self.save()) {
             self.prompt = Some(Prompt::Unsaved(after));
         } else {
             self.run(after);
@@ -241,10 +280,61 @@ impl App {
                 };
             }
             Cmd::Refresh => { self.tree.refresh(); self.status = "Refreshed file tree".into(); }
+            Cmd::ToggleAutosave => {
+                self.autosave = !self.autosave;
+                self.status = format!("Auto-save {}", if self.autosave { "on" } else { "off" });
+            }
+        }
+    }
+
+    fn version(&self) -> Option<u64> {
+        self.buf.as_ref().map(|b| b.version)
+    }
+
+    /// Restart the auto-save countdown if the last input changed the text.
+    fn note_edit(&mut self, before: Option<u64>) {
+        if self.version() != before && self.buf.as_ref().is_some_and(|b| b.dirty) {
+            self.last_edit = Some(Instant::now());
+        }
+    }
+
+    /// How long until an auto-save is due; `None` when nothing is pending,
+    /// so the main loop can sleep until the next key press.
+    pub fn autosave_wait(&self) -> Option<Duration> {
+        let b = self.buf.as_ref()?;
+        if !self.autosave || !b.dirty || self.autosave_failed == Some(b.version) || self.prompt.is_some() {
+            return None;
+        }
+        Some(AUTOSAVE_DELAY.saturating_sub(self.last_edit?.elapsed()))
+    }
+
+    /// Called by the main loop when it wakes up: save if the delay has passed.
+    pub fn tick(&mut self) {
+        if self.autosave_wait() == Some(Duration::ZERO) {
+            self.flush();
+        }
+    }
+
+    /// Save now if auto-save is on and there are changes (e.g. the terminal
+    /// lost focus or nib is exiting).
+    pub fn flush(&mut self) {
+        let Some(b) = self.buf.as_ref() else { return };
+        if self.autosave && b.dirty && self.autosave_failed != Some(b.version) {
+            let v = b.version;
+            if !self.save() {
+                self.autosave_failed = Some(v);
+                self.status = format!("Auto-save failed: {}", self.status.trim_start_matches("Save failed: "));
+            }
         }
     }
 
     pub fn on_key(&mut self, k: KeyEvent) {
+        let before = self.version();
+        self.handle_key(k);
+        self.note_edit(before);
+    }
+
+    fn handle_key(&mut self, k: KeyEvent) {
         self.status.clear();
         if self.prompt.is_some() {
             return self.on_prompt_key(k);
@@ -392,9 +482,11 @@ impl App {
         if self.prompt.is_some() || self.focus != Focus::Editor {
             return;
         }
+        let before = self.version();
         if let Some(b) = self.buf.as_mut() {
             b.insert(&text.replace("\r\n", "\n").replace('\r', "\n"));
         }
+        self.note_edit(before);
     }
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
@@ -484,6 +576,7 @@ mod tests {
     fn open_edit_save_and_unsaved_prompts() {
         let d = project("flow");
         let mut app = App::new(&d);
+        app.autosave = false;
         assert_eq!(app.focus, Focus::Tree);
         app.on_key(key(KeyCode::Enter)); // expand src
         app.on_key(key(KeyCode::Down));
@@ -509,6 +602,7 @@ mod tests {
     fn switching_files_asks_to_save_and_y_saves() {
         let d = project("switch");
         let mut app = App::new(&d.join("notes.txt"));
+        app.autosave = false;
         assert_eq!(app.tree.selected().unwrap().name, "notes.txt");
         typ(&mut app, "A");
         app.on_key(key(KeyCode::Esc)); // to tree
@@ -575,6 +669,84 @@ mod tests {
         app.on_key(ctrl('p'));
         app.on_key(key(KeyCode::Esc));
         assert!(app.prompt.is_none() && !app.quit);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn incremental_highlight_matches_full_recompute() {
+        use crate::highlight::line_states;
+        let d = project("hl");
+        let p = d.join("a.vue");
+        fs::write(&p, "<template>\n  <p>{{ x }}</p>\n</template>\n<script>\nconst a = 1\n</script>\n<style>\n.a { color: red }\n</style>\n").unwrap();
+        let mut app = App::new(&p);
+        let full = |app: &App| line_states(&app.buf.as_ref().unwrap().lines, lang_for(&p).unwrap());
+        app.line_states();
+        // Edits that change later lines' state: open a comment, a string, a tag.
+        for (y, text) in [(0, "<!-- "), (4, "`"), (1, "<div "), (7, "/* ")] {
+            app.buf.as_mut().unwrap().set_cur(Pos { y, x: 0 });
+            app.on_paste(text);
+            assert_eq!(app.line_states().to_vec(), full(&app), "after inserting {text:?} on line {y}");
+            app.on_key(ctrl('z'));
+            assert_eq!(app.line_states().to_vec(), full(&app), "after undo of {text:?}");
+        }
+        app.on_paste("\n\n");
+        assert_eq!(app.line_states().to_vec(), full(&app));
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn autosave_after_delay_and_before_switching_or_quitting() {
+        let d = project("autosave");
+        let notes = d.join("notes.txt");
+        let mut app = App::new(&notes);
+        assert!(app.autosave_wait().is_none(), "nothing pending when clean");
+        typ(&mut app, "A");
+        let wait = app.autosave_wait().unwrap();
+        assert!(wait > Duration::ZERO && wait <= AUTOSAVE_DELAY);
+        app.tick();
+        assert_eq!(fs::read_to_string(&notes).unwrap(), "hi\n", "not before the delay");
+        std::thread::sleep(AUTOSAVE_DELAY);
+        app.tick();
+        assert_eq!(fs::read_to_string(&notes).unwrap(), "Ahi\n");
+        assert!(app.autosave_wait().is_none());
+
+        // Switching files saves first instead of asking.
+        typ(&mut app, "B");
+        app.on_key(key(KeyCode::Esc));
+        app.tree.sel = app.tree.items.iter().position(|e| e.name == "src").unwrap();
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.prompt.is_none());
+        assert_eq!(fs::read_to_string(&notes).unwrap(), "ABhi\n");
+
+        // Quitting saves too.
+        typ(&mut app, "//");
+        app.on_key(ctrl('q'));
+        assert!(app.quit && app.prompt.is_none());
+        assert_eq!(fs::read_to_string(d.join("src/main.rs")).unwrap(), "//fn main() {}\n");
+
+        // Undo still works after auto-saves.
+        app.on_key(ctrl('z'));
+        assert_eq!(app.buf.as_ref().unwrap().text(), "fn main() {}\n");
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn failed_autosave_reports_once_and_falls_back_to_prompt() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = project("ro");
+        let f = d.join("notes.txt");
+        let mut app = App::new(&f);
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o555)).unwrap();
+        typ(&mut app, "A");
+        app.flush();
+        assert!(app.status.starts_with("Auto-save failed"), "{}", app.status);
+        assert!(app.autosave_wait().is_none(), "no retry loop");
+        app.on_key(ctrl('q'));
+        assert!(matches!(app.prompt, Some(Prompt::Unsaved(After::Quit))), "asks instead of losing the edit");
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
         fs::remove_dir_all(d).unwrap();
     }
 

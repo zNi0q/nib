@@ -30,6 +30,8 @@ fn tok_style(t: Tok) -> Style {
         Tok::Number => s.fg(Color::Rgb(255, 158, 100)),
         Tok::Func => s.fg(ACCENT),
         Tok::Type => s.fg(Color::Rgb(42, 195, 222)),
+        Tok::Tag => s.fg(Color::Rgb(247, 118, 142)),
+        Tok::Attr => s.fg(Color::Rgb(224, 175, 104)),
     }
 }
 
@@ -146,7 +148,7 @@ fn draw_editor(f: &mut Frame, app: &mut App, area: Rect) {
     let text = Rect { x: area.x + gutter, width: area.width.saturating_sub(gutter), ..area };
     app.text_area = text;
     app.follow_cursor();
-    let states = app.block_states().to_vec();
+    let states = app.line_states().to_vec();
     let buf = app.buf.as_ref().unwrap();
     let lang = buf.path.as_deref().and_then(lang_for);
     let (sy, sx) = app.scroll;
@@ -161,7 +163,7 @@ fn draw_editor(f: &mut Frame, app: &mut App, area: Rect) {
             if current { Style::default().fg(WARN) } else { Style::default().fg(DIM) },
         )));
         let toks = match lang {
-            Some(l) => highlight_line(line, l, &mut states.get(y).copied().unwrap_or(false)),
+            Some(l) => highlight_line(line, l, &mut states.get(y).copied().unwrap_or_default()),
             None => vec![Tok::Text; line.chars().count()],
         };
         // Expand tabs / control chars into cells, then crop to the view.
