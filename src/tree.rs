@@ -1,6 +1,3 @@
-//! Sidebar file tree: a flat list of entries where expanding a folder
-//! inserts its children right after it.
-
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,7 +30,6 @@ fn children(dir: &Path, depth: usize) -> Vec<Entry> {
                 return None;
             }
             let path = e.path();
-            // Follows symlinks, so a link to a folder shows as a folder.
             let is_dir = path.is_dir();
             Some(Entry { path, name, depth, is_dir, expanded: false })
         })
@@ -76,7 +72,6 @@ impl Tree {
         if self.items[i].expanded { self.collapse(i) } else { self.expand(i) }
     }
 
-    /// Select the parent folder of the selected entry.
     pub fn select_parent(&mut self) {
         let Some(depth) = self.selected().map(|e| e.depth) else { return };
         if let Some(p) = self.items[..self.sel].iter().rposition(|e| e.depth < depth) {
@@ -91,7 +86,6 @@ impl Tree {
         self.sel = (self.sel as isize + delta).clamp(0, self.items.len() as isize - 1) as usize;
     }
 
-    /// Re-read the disk, keeping expanded folders and the selection.
     pub fn refresh(&mut self) {
         let open: HashSet<PathBuf> = self.items.iter().filter(|e| e.expanded).map(|e| e.path.clone()).collect();
         let sel = self.selected().map(|e| e.path.clone());
@@ -106,7 +100,6 @@ impl Tree {
         self.sel = sel.and_then(|p| self.items.iter().position(|e| e.path == p)).unwrap_or(0).min(self.items.len().saturating_sub(1));
     }
 
-    /// Expand the folders leading to `path` and select it.
     pub fn reveal(&mut self, path: &Path) {
         let Ok(rel) = path.strip_prefix(&self.root) else { return };
         let mut cur = self.root.clone();

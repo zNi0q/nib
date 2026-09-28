@@ -1,8 +1,3 @@
-//! Syntax highlighter: hand-written scanners, no grammars or regexes, so it
-//! costs almost nothing in RAM or CPU. It works line by line; the only thing
-//! carried from one line to the next is a tiny `State` (an open comment or
-//! string, the current Vue/Svelte section, an open HTML tag, CSS brace depth).
-
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,9 +9,7 @@ pub enum Tok {
     Number,
     Func,
     Type,
-    /// HTML/JSX tag names and brackets, CSS element selectors.
     Tag,
-    /// HTML attributes, CSS properties, JSON/YAML/TOML keys.
     Attr,
 }
 
@@ -25,7 +18,6 @@ enum Open {
     #[default]
     None,
     Comment,
-    /// Multi-line string closed by this delimiter.
     Str(&'static str),
 }
 
@@ -37,13 +29,11 @@ enum Section {
     Style,
 }
 
-/// Highlighter state at the start of a line.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct State {
     open: Open,
     section: Section,
     in_tag: bool,
-    /// The tag being read is <script>/<style>: switch section when it closes.
     tag_opens: Option<Section>,
     depth: u8,
 }
@@ -71,19 +61,14 @@ pub struct Lang {
     line: &'static [&'static str],
     block: Option<(&'static str, &'static str)>,
     quotes: &'static [char],
-    /// Delimiters of strings that may span lines (`"""`, backticks).
     multi: &'static [&'static str],
-    /// `'` only starts 'x' / '\n' char literals (Rust lifetimes stay plain).
     char_lit: bool,
     kw: &'static [&'static str],
     case_insensitive: bool,
     jsx: bool,
     decorators: bool,
-    /// Shell-style `$VAR` / `${VAR}`.
     vars: bool,
-    /// C-style `#include` at line start.
     preproc: bool,
-    /// A string followed by `:` is a key (JSON).
     json_keys: bool,
 }
 
@@ -239,8 +224,6 @@ pub fn lang_for(path: &Path) -> Option<&'static Lang> {
     LANGS.iter().find(|(exts, _)| exts.contains(&ext)).map(|(_, l)| *l)
 }
 
-/// One token kind per char of `line`. `st` is the state at the start of the
-/// line and is updated to the state at the start of the next line.
 pub fn highlight_line(line: &str, lang: &Lang, st: &mut State) -> Vec<Tok> {
     let cs: Vec<char> = line.chars().collect();
     let mut out = vec![Tok::Text; cs.len()];
@@ -256,7 +239,6 @@ pub fn highlight_line(line: &str, lang: &Lang, st: &mut State) -> Vec<Tok> {
     out
 }
 
-/// State at the start of each line.
 pub fn line_states(lines: &[String], lang: &Lang) -> Vec<State> {
     let mut st = State::default();
     lines
@@ -306,7 +288,6 @@ impl Hl<'_> {
         (from..end).find(|&j| self.at(j, pat))
     }
 
-    /// Like `find`, skipping backslash-escaped characters.
     fn find_unescaped(&self, from: usize, end: usize, pat: &str) -> Option<usize> {
         let mut j = from;
         while j < end {
@@ -341,7 +322,6 @@ impl Hl<'_> {
         j
     }
 
-    /// End (exclusive) of a quoted string starting at `i`, within the line.
     fn string_end(&self, i: usize, end: usize) -> usize {
         let q = self.cs[i];
         let mut j = i + 1;
@@ -351,7 +331,6 @@ impl Hl<'_> {
         (j + 1).min(end)
     }
 
-    /// Index of the `}` matching the `{` at `i` (or `end`).
     fn match_brace(&self, i: usize, end: usize) -> usize {
         let mut depth = 0;
         for j in i..end {
@@ -369,7 +348,6 @@ impl Hl<'_> {
         end
     }
 
-    /// Finish an open comment/string: color up to and including `close`.
     fn close(&mut self, i: usize, end: usize, close: &str, t: Tok) -> usize {
         match self.find_unescaped(i, end, close) {
             Some(p) => {
@@ -385,14 +363,11 @@ impl Hl<'_> {
         }
     }
 
-    /// Highlight `{ expr }` embedded in markup with a scratch state.
     fn embedded(&mut self, a: usize, b: usize, lang: &Lang) {
         let mut scratch = State::default();
         let mut h = Hl { cs: self.cs, out: &mut *self.out, st: &mut scratch };
         h.code(a, b, lang);
     }
-
-    // ---------- programming languages ----------
 
     fn code(&mut self, mut i: usize, end: usize, l: &Lang) {
         if l.jsx && self.st.in_tag {
@@ -476,7 +451,6 @@ impl Hl<'_> {
             if ident(c) {
                 let e = self.word_end(i, end, ident);
                 let word: String = self.cs[i..e].iter().collect();
-                // Python string prefixes: f"..", r'..', b"..".
                 if l.name == "Python" && e - i <= 2 && word.chars().all(|c| "fFrRbBuU".contains(c))
                     && matches!(self.cs.get(e), Some('"') | Some('\''))
                 {
@@ -506,7 +480,6 @@ impl Hl<'_> {
         }
     }
 
-    /// Is the `<` at `i` the start of a JSX tag (not a less-than)?
     fn jsx_tag_start(&self, i: usize) -> bool {
         let next = self.cs.get(i + 1).copied();
         if !next.is_some_and(|c| c.is_alphabetic() || c == '/' || c == '>') {
@@ -522,9 +495,6 @@ impl Hl<'_> {
         "(=,:?&|{[;>!".contains(pc)
     }
 
-    // ---------- markup (HTML, Vue, Svelte, JSX tags) ----------
-
-    /// `<name` … : color the tag name, then read attributes.
     fn tag_open(&mut self, i: usize, end: usize, braces: bool, inner: &Lang) -> usize {
         let mut j = i + 1;
         let closing = self.cs.get(j) == Some(&'/');
@@ -552,7 +522,6 @@ impl Hl<'_> {
         self.tag_rest(ne, end, braces, inner)
     }
 
-    /// Attributes up to the closing `>` (which may be on a later line).
     fn tag_rest(&mut self, mut i: usize, end: usize, braces: bool, inner: &Lang) -> usize {
         while i < end {
             let c = self.cs[i];
@@ -588,8 +557,6 @@ impl Hl<'_> {
         end
     }
 
-    /// Markup text and tags. Returns early (at the new position) when a
-    /// <script>/<style> tag closes, so `sfc` can switch language.
     fn markup(&mut self, mut i: usize, end: usize, l: &Lang) -> usize {
         let braces = l.flavor == Flavor::Svelte;
         while i < end {
@@ -654,12 +621,10 @@ impl Hl<'_> {
         end
     }
 
-    /// After a tag closes: did it open a <script> or <style> section?
     fn section_switch(&mut self) -> Option<Section> {
         if self.st.in_tag { None } else { self.st.tag_opens.take() }
     }
 
-    /// HTML / Vue / Svelte: markup with embedded script and style sections.
     fn sfc(&mut self, l: &Lang) {
         let n = self.cs.len();
         let mut i = 0;
@@ -681,8 +646,6 @@ impl Hl<'_> {
             }
         }
     }
-
-    // ---------- CSS / SCSS ----------
 
     fn css(&mut self, mut i: usize, end: usize, l: &Lang) {
         let last_brace = self.cs[..end].iter().rposition(|c| *c == '{');
@@ -775,8 +738,6 @@ impl Hl<'_> {
         }
     }
 
-    // ---------- Markdown ----------
-
     fn markdown(&mut self) {
         let n = self.cs.len();
         let start = self.word_end(0, n, char::is_whitespace);
@@ -837,8 +798,6 @@ impl Hl<'_> {
         }
     }
 
-    // ---------- TOML / YAML / INI / .env / Dockerfile / Makefile ----------
-
     fn config(&mut self, l: &Lang) {
         let n = self.cs.len();
         if self.st.open != Open::None {
@@ -875,7 +834,6 @@ impl Hl<'_> {
             && self.cs[i..key_end].iter().all(|c| c.is_ascii_uppercase())
             && self.cs.get(key_end) == Some(&' ')
         {
-            // Dockerfile instruction (FROM, RUN, COPY …).
             self.fill(i, key_end, Tok::Keyword);
             i = key_end;
         }
@@ -888,8 +846,6 @@ mod tests {
     use super::*;
     use Tok::*;
 
-    /// Token of `needle` (first occurrence) in multi-line `text`, asserting
-    /// every char of it got the same token.
     fn tok(path: &str, text: &str, needle: &str) -> Tok {
         let lang = lang_for(Path::new(path)).unwrap_or_else(|| panic!("no lang for {path}"));
         let mut st = State::default();

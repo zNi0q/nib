@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""Minimal fake LSP server for nib's end-to-end tests (stdlib only).
-
-Speaks JSON-RPC over stdio with Content-Length framing. Behavior:
-- initialize: advertises full sync, hover, definition, completion ('.' trigger).
-- after `initialized`: sends a workspace/configuration request and publishes
-  no diagnostics until the client answers it.
-- didOpen/didChange: lines with BAD -> error "bad thing here",
-  lines with WARN -> warning "careful" (UTF-16 columns).
-- hover: "**fake hover** for <word>".
-- definition: `fn <word>` in the same file; word `other` -> other.fk line 1 col 3.
-- completion: alpha (detail "first"), alphabet, beta.
-Env: FAKE_PIDFILE (pid written on start), FAKE_LOG (received methods appended).
-"""
 
 import json
 import os
@@ -21,7 +8,7 @@ import sys
 stdin = sys.stdin.buffer
 stdout = sys.stdout.buffer
 
-docs = {}  # uri -> text
+docs = {}
 config_answered = False
 config_req_id = "cfg-1"
 LOG = os.environ.get("FAKE_LOG")
@@ -62,7 +49,6 @@ def utf16_len(s):
 
 
 def char_at_utf16(line, col16):
-    """Index into `line` (python str) of UTF-16 column col16."""
     n = 0
     for i, ch in enumerate(line):
         if n >= col16:
@@ -109,12 +95,10 @@ def main():
     if pidfile:
         with open(pidfile, "w") as f:
             f.write(str(os.getpid()))
-        # A helper process, like real servers start (e.g. rust-analyzer's proc-macro server).
         import subprocess
         helper = subprocess.Popen(["sleep", "300"], stdin=subprocess.DEVNULL)
         with open(pidfile + ".helper", "w") as f:
             f.write(str(helper.pid))
-        # Stubborn mode: ignore exit requests and SIGTERM (needs SIGKILL).
         if os.path.exists(pidfile + ".stubborn"):
             import signal
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -133,7 +117,6 @@ def main():
             log(method)
         mid = msg.get("id")
 
-        # Response from the client (to our configuration request).
         if method is None:
             if mid == config_req_id and "result" in msg:
                 config_answered = True

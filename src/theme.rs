@@ -1,6 +1,3 @@
-//! Color themes. Backgrounds stay the terminal's own except for bars and the
-//! selection, so nib blends into the terminal theme.
-
 use ratatui_core::style::Color;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -91,7 +88,6 @@ pub fn builtin(name: &str) -> Option<Theme> {
     }
 }
 
-/// "#rrggbb" (or "rrggbb") to a color.
 pub fn parse_color(s: &str) -> Result<Color, String> {
     let h = s.trim().trim_start_matches('#');
     if h.len() != 6 {
@@ -101,7 +97,6 @@ pub fn parse_color(s: &str) -> Result<Color, String> {
 }
 
 impl Theme {
-    /// Set one color by its config name.
     pub fn set(&mut self, name: &str, c: Color) -> Result<(), String> {
         let slot = match name {
             "text" => &mut self.text,

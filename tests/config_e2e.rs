@@ -1,7 +1,3 @@
-//! End-to-end tests for the config system: run the real `nib` binary in tmux
-//! with a temp XDG_CONFIG_HOME containing `nib/config.nib`, and check both
-//! the screen (including colors via `capture-pane -e`) and files on disk.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -21,7 +17,6 @@ fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
     false
 }
 
-/// Temp dir with `cfg/` (XDG_CONFIG_HOME) and `proj/` (files to edit).
 struct Fixture(PathBuf);
 
 impl Fixture {
@@ -103,7 +98,6 @@ impl Tmux {
         let out = Command::new("tmux").args(["capture-pane", "-p", "-t", &self.0]).output().unwrap();
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
-    /// Screen with color escape sequences.
     fn screen_colors(&self) -> String {
         let out = Command::new("tmux").args(["capture-pane", "-e", "-p", "-t", &self.0]).output().unwrap();
         String::from_utf8_lossy(&out.stdout).into_owned()
@@ -132,7 +126,6 @@ impl Tmux {
         sleep(Duration::from_millis(300));
         assert!(!self.screen().contains("config.nib:"), "unexpected config error:\n{}", self.screen());
     }
-    /// Open the palette, filter, and return the screen line containing `row`.
     fn palette_row(&self, filter: &str, row: &str) -> String {
         self.keys(&["C-p"]);
         self.wait_for(" Commands ");
@@ -155,8 +148,6 @@ fn nib_cli(fx: &Fixture, args: &[&str]) -> (bool, String) {
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     (out.status.success(), text)
 }
-
-// ---------- 1. custom keybinding ----------
 
 #[test]
 fn rebinding_save_replaces_the_default_key() {
@@ -182,8 +173,6 @@ fn rebinding_save_replaces_the_default_key() {
     assert!(!row.contains("Ctrl+S"), "palette row: {row:?}");
 }
 
-// ---------- 2. several keys for one command ----------
-
 #[test]
 fn list_of_keys_is_accepted_and_first_is_shown() {
     let fx = Fixture::new("multi");
@@ -194,8 +183,6 @@ fn list_of_keys_is_accepted_and_first_is_shown() {
     let row = t.palette_row("go to def", "Go to definition");
     assert!(row.contains("F12"), "palette row: {row:?}");
 }
-
-// ---------- 3. editor settings ----------
 
 #[test]
 fn tab_width_sets_spaces_per_tab() {
@@ -258,8 +245,6 @@ fn autosave_off_brings_back_the_quit_prompt() {
     assert_eq!(fx.read("a.txt"), "alpha\n");
 }
 
-// ---------- 4. themes ----------
-
 #[test]
 fn builtin_themes_and_color_overrides() {
     let rust = "fn main() {\n    let x = 1;\n}\n";
@@ -270,7 +255,7 @@ fn builtin_themes_and_color_overrides() {
     let t = Tmux::start("gruvbox", &fx, &f);
     t.wait_for("let x");
     t.no_config_error();
-    t.wait_colors("38;2;251;73;52"); // gruvbox keyword #fb4934
+    t.wait_colors("38;2;251;73;52");
     drop(t);
 
     let fx = Fixture::new("catppuccin");
@@ -290,8 +275,6 @@ fn builtin_themes_and_color_overrides() {
     t.wait_colors("38;2;1;2;3");
 }
 
-// ---------- 5. errors never break nib ----------
-
 #[test]
 fn invalid_toml_reports_line_and_editing_still_works() {
     let fx = Fixture::new("badtoml");
@@ -302,7 +285,7 @@ fn invalid_toml_reports_line_and_editing_still_works() {
     assert!(t.line_with("config.nib:").contains("line"), "{}", t.screen());
     t.literal("ok ");
     t.wait_for("ok alpha");
-    t.keys(&["C-s"]); // defaults apply: Ctrl+S saves
+    t.keys(&["C-s"]);
     fx.wait_disk("a.txt", "ok alpha\n");
 }
 
@@ -325,7 +308,7 @@ fn plain_letter_binding_is_rejected_and_letter_still_types() {
     t.wait_for("config.nib:");
     t.literal("x");
     t.wait_for("xalpha");
-    fx.wait_disk("a.txt", "xalpha\n"); // auto-save still on
+    fx.wait_disk("a.txt", "xalpha\n");
 }
 
 #[test]
@@ -338,8 +321,6 @@ fn bad_color_is_an_error() {
     t.wait_for("fn main");
 }
 
-// ---------- 6. live reload ----------
-
 #[test]
 fn saving_config_inside_nib_reloads_it() {
     let fx = Fixture::new("reload");
@@ -350,7 +331,6 @@ fn saving_config_inside_nib_reloads_it() {
     let ok = wait_until(TIMEOUT, || t.status_bar().contains("Config"));
     assert!(ok, ".nib not highlighted as Config:\n{}", t.status_bar());
 
-    // Add a [keys] section and save with the (still default) Ctrl+S.
     t.keys(&["C-End"]);
     t.keys(&["Enter"]);
     t.literal("[keys]");
@@ -361,7 +341,6 @@ fn saving_config_inside_nib_reloads_it() {
     let on_disk = fs::read_to_string(&cfg).unwrap();
     assert!(on_disk.contains("save = \"ctrl+o\""), "{on_disk:?}");
 
-    // New binding is live: Ctrl+S no longer saves, Ctrl+O does.
     t.keys(&["Enter"]);
     t.literal("# after");
     t.keys(&["C-s"]);
@@ -372,8 +351,6 @@ fn saving_config_inside_nib_reloads_it() {
     assert!(ok, "Ctrl+O did not save after reload:\n{}", t.screen());
     t.wait_for("Config reloaded");
 }
-
-// ---------- 7. CLI ----------
 
 #[test]
 fn config_cli_create_check_path() {
@@ -409,8 +386,6 @@ fn config_cli_create_check_path() {
     assert!(!ok, "broken config passed check: {out}");
     assert!(out.contains("line"), "{out}");
 }
-
-// ---------- 8. LSP can be switched off ----------
 
 #[test]
 fn lsp_disabled_starts_no_server() {

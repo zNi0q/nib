@@ -1,12 +1,3 @@
-//! Minimal LSP client, built to cost as little as possible:
-//! - a server starts only when a file of its type is opened, and one server is
-//!   shared per (plugin, project root);
-//! - it is shut down `idle_timeout` seconds after its last file closes;
-//! - edits are sent as one debounced full-text sync, not per keystroke;
-//! - a reader thread per server blocks on its stdout and wakes the editor
-//!   through the same channel as the keyboard, so nothing polls;
-//! - stored diagnostics and completion lists are capped; stderr is discarded.
-
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Write};
@@ -21,18 +12,14 @@ use serde_json::{json, Value};
 use crate::buffer::Buffer;
 use crate::plugin::{resolve_command, Plugin};
 
-/// didChange is sent this long after the last edit.
 pub const CHANGE_DELAY: Duration = Duration::from_millis(300);
 const MAX_DIAGS: usize = 1000;
 const MAX_ITEMS: usize = 200;
 const MAX_HOVER: usize = 4000;
 
-/// Everything that can wake the main loop.
 pub enum Wake {
     Term(crossterm::event::Event),
-    /// A message from server `id`; `None` when the server exited.
     Lsp(usize, Option<Value>),
-    /// The terminal went away (window closed): save and clean up.
     Closed,
 }
 
@@ -47,7 +34,6 @@ pub enum Severity {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Diag {
     pub line: usize,
-    /// UTF-16 column, as sent by the server.
     pub col16: usize,
     pub severity: Severity,
     pub message: String,
@@ -66,7 +52,6 @@ pub struct Item {
     pub detail: String,
     pub insert: String,
     pub filter: String,
-    /// Start (line, UTF-16 col) of the text the server wants replaced.
     pub edit_start: Option<(usize, usize)>,
 }
 
@@ -80,7 +65,6 @@ pub enum Reply {
 
 enum Req {
     Initialize,
-    /// Pull diagnostics (LSP 3.17 `textDocument/diagnostic`) for this file.
     Diagnostic(PathBuf),
     Definition,
     Hover,
@@ -97,19 +81,16 @@ struct Server {
     next_req: i64,
     pending: HashMap<i64, Req>,
     ready: bool,
-    /// Messages to send once `initialize` has been answered.
     queue: Vec<Value>,
     open: HashSet<String>,
     idle_since: Option<Instant>,
     triggers: Vec<char>,
-    /// Server wants diagnostics requested (pull) rather than pushing them.
     pull_diags: bool,
 }
 
 impl Server {
     fn write(&mut self, v: &Value) {
         let body = v.to_string();
-        // A dead server shows up as EOF on the reader thread; ignore write errors here.
         let _ = write!(self.stdin, "Content-Length: {}\r\n\r\n{body}", body.len()).and_then(|_| self.stdin.flush());
     }
 
@@ -128,7 +109,6 @@ impl Server {
         if matches!(self.pending[&self.next_req], Req::Initialize) { self.write(&msg) } else { self.send(msg) }
     }
 
-    /// Ask the server to exit and hand back its process for cleanup.
     fn ask_exit(mut self) -> Child {
         self.ready = true;
         self.request("shutdown", Value::Null, Req::Other);
@@ -136,15 +116,12 @@ impl Server {
         self.child
     }
 
-    /// Stop in the background (idle timeout) without blocking the editor.
     fn stop(self) {
         let child = self.ask_exit();
         std::thread::spawn(move || reap(vec![child], Duration::from_millis(500)));
     }
 }
 
-/// Give servers `grace` to exit on their own, then end their whole process
-/// groups (servers often start helper processes) and collect them.
 fn reap(mut children: Vec<Child>, grace: Duration) {
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline && children.iter_mut().any(|c| matches!(c.try_wait(), Ok(None))) {
@@ -164,7 +141,6 @@ fn reap(mut children: Vec<Child>, grace: Duration) {
     }
 }
 
-/// The few OS calls needed for clean process handling (no libc crate).
 mod sys {
     pub const SIGTERM: i32 = 15;
     pub const SIGKILL: i32 = 9;
@@ -175,7 +151,6 @@ mod sys {
         fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
     }
 
-    /// Signal every process in the group led by `pgid`.
     pub fn kill_group(pgid: u32, sig: i32) {
         unsafe { kill(-(pgid as i32), sig) };
     }
@@ -184,7 +159,6 @@ mod sys {
         unsafe { kill(-(pgid as i32), 0) == 0 }
     }
 
-    /// In the child before exec: get SIGTERM if nib dies (even from a crash).
     pub fn die_with_parent() {
         #[cfg(target_os = "linux")]
         unsafe {
@@ -209,7 +183,6 @@ pub struct Lsp {
     next_id: usize,
     doc: Option<Doc>,
     diags: HashMap<PathBuf, Vec<Diag>>,
-    /// Idle timeout for plugins that don't set their own.
     default_idle: u64,
 }
 
@@ -240,7 +213,6 @@ impl Lsp {
         self.diags.get(path).map_or(&[], Vec::as_slice)
     }
 
-    /// Name of the current file's server and whether it has finished starting.
     pub fn label(&self) -> Option<(&str, bool)> {
         let s = self.server(self.doc.as_ref()?.server)?;
         Some((&s.plugin.name, s.ready))
@@ -250,7 +222,6 @@ impl Lsp {
         self.doc.as_ref().and_then(|d| self.server(d.server)).is_some_and(|s| s.ready && s.triggers.contains(&c))
     }
 
-    /// A file was opened in the editor. Returns a message for the user, if any.
     pub fn open(&mut self, path: &Path, text: &str) -> Option<String> {
         self.close();
         let ext = path.extension()?.to_string_lossy().to_lowercase();
@@ -276,7 +247,6 @@ impl Lsp {
         None
     }
 
-    /// For pull-model servers: ask for the current file's diagnostics.
     fn pull_diagnostics(&mut self) {
         let Some((s, d)) = self.doc_server() else { return };
         if s.ready && s.pull_diags {
@@ -324,7 +294,6 @@ impl Lsp {
         }
     }
 
-    /// Next time `tick` has work to do (debounced sync or idle shutdown).
     pub fn deadline(&self) -> Option<Instant> {
         let idle = self
             .servers
@@ -380,11 +349,10 @@ impl Lsp {
 
     pub fn handle(&mut self, id: usize, msg: Option<Value>) -> Option<Reply> {
         let Some(msg) = msg else {
-            // Server exited (crashed, or finished after `stop`).
             let i = self.servers.iter().position(|s| s.id == id)?;
             let s = self.servers.remove(i);
             let mut child = s.child;
-            sys::kill_group(child.id(), sys::SIGKILL); // helpers it left behind
+            sys::kill_group(child.id(), sys::SIGKILL);
             let _ = child.kill();
             let _ = child.wait();
             if self.doc.as_ref().is_some_and(|d| d.server == id) {
@@ -399,10 +367,8 @@ impl Lsp {
         let s = self.server_mut(id)?;
         if let Some(method) = msg.get("method").and_then(Value::as_str) {
             if let Some(req_id) = msg.get("id") {
-                // Server → client request: answer so the server never waits on us.
                 let result = match method {
                     "workspace/configuration" => {
-                        // An empty object, not null: some servers crash on null.
                         let settings = s.plugin.settings.as_ref().and_then(|v| serde_json::to_value(v).ok());
                         let items = msg.pointer("/params/items").and_then(Value::as_array).cloned().unwrap_or_default();
                         Value::Array(items.iter().map(|it| config_section(settings.as_ref(), it.get("section").and_then(Value::as_str))).collect())
@@ -435,7 +401,6 @@ impl Lsp {
             return match req {
                 Req::Other | Req::Diagnostic(_) => None,
                 Req::Initialize => {
-                    // The server refused to start: stop it instead of waiting forever.
                     let i = self.servers.iter().position(|s| s.id == id)?;
                     let s = self.servers.remove(i);
                     let name = s.plugin.name.clone();
@@ -468,7 +433,6 @@ impl Lsp {
                 None
             }
             Req::Diagnostic(path) => {
-                // "unchanged" reports keep what we have.
                 if result.get("kind").and_then(Value::as_str) == Some("full") {
                     let diags = parse_diagnostics(result.get("items").unwrap_or(&Value::Null));
                     if diags.is_empty() { self.diags.remove(&path); } else { self.diags.insert(path, diags); }
@@ -482,7 +446,6 @@ impl Lsp {
         }
     }
 
-    /// One line per running server with the RAM its whole process tree uses.
     pub fn status(&self) -> String {
         if self.servers.is_empty() {
             return "LSP: no servers running".into();
@@ -507,7 +470,6 @@ impl Lsp {
         }
     }
 
-    /// Stop every server; if a file is open, start its server again.
     pub fn restart(&mut self, buf: Option<&Buffer>) -> Option<String> {
         let path = self.doc.as_ref().map(|d| d.path.clone());
         self.shutdown_all();
@@ -523,12 +485,9 @@ impl Lsp {
             return Err(format!("LSP: {} not found — install: {hint}", p.command));
         };
         let mut cmd = Command::new(exe);
-        // Own process group, so the server and anything it starts can be
-        // stopped together; and it dies with nib even if nib crashes.
         {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
-            // SAFETY: prctl is async-signal-safe and touches no Rust state.
             unsafe {
                 cmd.pre_exec(|| {
                     sys::die_with_parent();
@@ -611,16 +570,12 @@ impl Lsp {
 }
 
 impl Drop for Lsp {
-    /// nib is exiting: stop every server and its helpers before we go.
     fn drop(&mut self) {
         let children = std::mem::take(&mut self.servers).into_iter().map(Server::ask_exit).collect();
         reap(children, Duration::from_millis(300));
     }
 }
 
-// ---------- protocol helpers ----------
-
-/// Read one `Content-Length`-framed JSON message.
 pub fn read_message(r: &mut impl BufRead) -> io::Result<Value> {
     let mut len = None;
     let mut line = String::new();
@@ -695,7 +650,6 @@ fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("").trim()
 }
 
-/// Nearest folder upwards from `file` that contains one of `markers`.
 pub fn find_root(file: &Path, markers: &[String]) -> PathBuf {
     let dir = file.parent().unwrap_or(Path::new("/"));
     dir.ancestors()
@@ -746,8 +700,6 @@ pub fn parse_locations(v: &Value) -> Vec<Location> {
     }
 }
 
-/// The `section` (dotted path, e.g. "css" or "python.analysis") of a plugin's
-/// settings, or `{}`.
 pub fn config_section(settings: Option<&Value>, section: Option<&str>) -> Value {
     let mut v = settings;
     for part in section.unwrap_or("").split('.').filter(|p| !p.is_empty()) {
@@ -760,7 +712,6 @@ pub fn config_section(settings: Option<&Value>, section: Option<&str>) -> Value 
     }
 }
 
-/// Hover contents as plain text (markdown code fences dropped).
 pub fn hover_text(v: &Value) -> String {
     fn part(v: &Value) -> String {
         match v {
@@ -781,7 +732,6 @@ pub fn hover_text(v: &Value) -> String {
     s
 }
 
-/// Turn a snippet like `log(${1:msg})$0` into plain text `log(msg)`.
 fn strip_snippet(s: &str) -> String {
     let mut out = String::new();
     let cs: Vec<char> = s.chars().collect();
@@ -793,7 +743,6 @@ fn strip_snippet(s: &str) -> String {
                 i += 2;
             }
             '$' if cs.get(i + 1) == Some(&'{') => {
-                // ${1:default} or ${1}
                 let mut j = i + 2;
                 while j < cs.len() && cs[j].is_ascii_digit() {
                     j += 1;
@@ -834,7 +783,6 @@ fn strip_snippet(s: &str) -> String {
 
 pub fn parse_completion(v: &Value) -> Vec<Item> {
     let items = v.as_array().or_else(|| v.get("items").and_then(Value::as_array));
-    // LSP 3.17: a shared replace range for items without their own textEdit.
     let default_start = v
         .pointer("/itemDefaults/editRange/start")
         .or_else(|| v.pointer("/itemDefaults/editRange/insert/start"))
@@ -878,14 +826,11 @@ pub fn parse_completion(v: &Value) -> Vec<Item> {
     out.into_iter().take(MAX_ITEMS).map(|(_, i)| i).collect()
 }
 
-/// Resident memory (kB) of `pid` and all its descendants — language servers
-/// often run their real work in child processes (e.g. tsserver under node).
 pub fn tree_rss_kb(pid: u32) -> u64 {
     let mut parent: HashMap<u32, u32> = HashMap::new();
     if let Ok(rd) = std::fs::read_dir("/proc") {
         for e in rd.flatten() {
             let Some(p) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
-            // /proc/<pid>/stat: "pid (comm) state ppid ..." — comm may contain spaces.
             if let Ok(stat) = std::fs::read_to_string(format!("/proc/{p}/stat")) {
                 if let Some(ppid) = stat.rsplit_once(')').and_then(|(_, r)| r.split_whitespace().nth(1)?.parse().ok()) {
                     parent.insert(p, ppid);

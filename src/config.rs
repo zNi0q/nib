@@ -1,7 +1,3 @@
-//! User config: `~/.config/nib/config.nib` (TOML syntax). Every setting has a
-//! default; anything invalid is reported and falls back to its default, so a
-//! typo never stops nib from starting.
-
 use std::fs;
 use std::path::PathBuf;
 
@@ -52,7 +48,6 @@ impl Default for Config {
     }
 }
 
-/// `$XDG_CONFIG_HOME/nib` (default `~/.config/nib`).
 pub fn dir() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
@@ -65,7 +60,6 @@ pub fn path() -> PathBuf {
     dir().join(FILE)
 }
 
-/// Load the config file (missing file = all defaults) and any error messages.
 pub fn load() -> (Config, Vec<String>) {
     match fs::read_to_string(path()) {
         Ok(text) => parse(&text),
@@ -179,8 +173,6 @@ fn theme_section(t: &Table, errs: &mut Vec<String>) -> Theme {
     th
 }
 
-// ---------- keys ----------
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Key {
     pub code: KeyCode,
@@ -192,7 +184,6 @@ pub struct Key {
 pub fn parse_key(s: &str) -> Result<Key, String> {
     let lower = s.trim().to_lowercase();
     let mut parts: Vec<&str> = lower.split('+').collect();
-    // "ctrl++" means Ctrl and the plus key.
     if lower.ends_with("++") {
         parts.pop();
         parts.pop();
@@ -279,7 +270,6 @@ impl Key {
     }
 }
 
-/// Which key runs which command.
 #[derive(Clone, Debug)]
 pub struct Keymap {
     binds: Vec<(Key, Cmd)>,
@@ -320,7 +310,6 @@ impl Keymap {
                 Err(e) => errs.push(format!("{FILE}: [keys] {id}: {e}")),
             }
         }
-        // Defaults for everything not overridden, unless the user took that key.
         let mut binds = user.clone();
         for (k, c) in Keymap::defaults().binds {
             if !overridden.contains(&c) && !user.iter().any(|(uk, _)| *uk == k) {
@@ -334,13 +323,10 @@ impl Keymap {
         self.binds.iter().find(|(k, _)| k.matches(ev)).map(|(_, c)| *c)
     }
 
-    /// First key bound to `cmd`, for display.
     pub fn label(&self, cmd: Cmd) -> String {
         self.binds.iter().find(|(_, c)| *c == cmd).map(|(k, _)| k.label()).unwrap_or_default()
     }
 }
-
-// ---------- default file and CLI ----------
 
 pub fn template() -> String {
     let d = Settings::default();
@@ -394,7 +380,6 @@ idle_timeout = {idle}        # seconds before an unused server is stopped (plugi
     )
 }
 
-/// `nib config …`. Returns the exit code.
 pub fn cli(args: &[String]) -> i32 {
     let p = path();
     match args.first().map(String::as_str) {

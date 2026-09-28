@@ -1,9 +1,3 @@
-//! LSP plugins: small TOML files that say which language server to run for
-//! which files. They are plain data (no scripting runtime), so an installed
-//! plugin costs nothing until a matching file is opened.
-//!
-//! Location: $XDG_CONFIG_HOME/nib/plugins/*.toml (default ~/.config/nib/plugins).
-
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,30 +11,21 @@ pub struct Plugin {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
-    /// File extensions (without dot) this server handles.
     pub extensions: Vec<String>,
-    /// LSP languageId per extension; defaults to the extension itself.
     #[serde(default)]
     pub language_ids: HashMap<String, String>,
-    /// Files/folders that mark the project root (searched upwards).
     #[serde(default = "default_roots")]
     pub root_markers: Vec<String>,
-    /// Seconds without an open file of this type before the server is stopped
-    /// (default: `[lsp] idle_timeout` in config.nib).
     #[serde(default)]
     pub idle_timeout: Option<u64>,
-    /// Extra environment for the server, e.g. NODE_OPTIONS memory caps.
     #[serde(default)]
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub init_options: Option<toml::Value>,
-    /// Answers to the server's `workspace/configuration` requests, by section,
-    /// e.g. `settings = { css = { validate = true } }`.
     #[serde(default)]
     pub settings: Option<toml::Value>,
     #[serde(default = "yes")]
     pub enabled: bool,
-    /// Install hint shown when the command isn't found.
     #[serde(default)]
     pub install: Option<String>,
 }
@@ -70,7 +55,6 @@ fn home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
 }
 
-/// All plugins in the plugin folder, plus a warning per file that failed to parse.
 pub fn load() -> (Vec<Plugin>, Vec<String>) {
     let mut plugins = Vec::new();
     let mut warnings = Vec::new();
@@ -87,8 +71,6 @@ pub fn load() -> (Vec<Plugin>, Vec<String>) {
     (plugins, warnings)
 }
 
-/// Find an executable: PATH first, then common per-user install folders
-/// (Mason, Go, Cargo, Bun, npm-global, ~/.local/bin).
 pub fn resolve_command(cmd: &str) -> Option<PathBuf> {
     let p = Path::new(cmd);
     if p.components().count() > 1 {
@@ -110,13 +92,10 @@ pub fn resolve_command(cmd: &str) -> Option<PathBuf> {
         .find(|c| is_exec(c) && !(is_rustup_proxy(c) && !rustup_has(cmd)))
 }
 
-/// rustup puts stand-ins for every tool on PATH (e.g. rust-analyzer), even for
-/// components that aren't installed; running one then just prints an error.
 fn is_rustup_proxy(p: &Path) -> bool {
     if fs::canonicalize(p).is_ok_and(|c| c.file_name().is_some_and(|n| n == "rustup")) {
         return true;
     }
-    // ~/.cargo/bin proxies are copies of rustup rather than symlinks.
     let rustup = p.with_file_name("rustup");
     match (fs::metadata(p), fs::metadata(&rustup)) {
         (Ok(a), Ok(b)) => p.file_name().is_some_and(|n| n != "rustup") && a.len() == b.len(),
@@ -138,7 +117,6 @@ fn is_exec(p: &Path) -> bool {
     fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// Where presets install self-contained servers: $XDG_DATA_HOME/nib (~/.local/share/nib).
 pub fn data_dir() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME")
         .filter(|v| !v.is_empty())
@@ -146,8 +124,6 @@ pub fn data_dir() -> PathBuf {
         .unwrap_or_else(|| home().join(".local/share"))
         .join("nib")
 }
-
-// ---------- built-in presets ----------
 
 const NODE_CAP: &str = r#"env = { NODE_OPTIONS = "--max-old-space-size=1024" }"#;
 
@@ -284,7 +260,6 @@ idle_timeout = 120
 enabled = true
 "#;
 
-/// `nib plugin …`. Returns the process exit code.
 pub fn cli(args: &[String]) -> i32 {
     let dir = dir();
     let arg = |i: usize| args.get(i).map(String::as_str);
@@ -355,8 +330,6 @@ pub fn cli(args: &[String]) -> i32 {
     }
 }
 
-/// `nib plugin install`: install each server with its preset's command, then
-/// add the plugin file. Returns the exit code (1 if anything failed).
 fn install(names: &[String]) -> i32 {
     let all = presets();
     let chosen: Vec<(&str, String)> = if names.iter().any(|n| n == "all") {
@@ -424,7 +397,6 @@ fn tool_hint(tool: &str) -> &'static str {
     }
 }
 
-/// Can npm install globally without root?
 fn npm_global_writable() -> bool {
     let Ok(out) = std::process::Command::new("npm").args(["prefix", "-g"]).output() else { return false };
     let prefix = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
@@ -434,9 +406,6 @@ fn npm_global_writable() -> bool {
     ok
 }
 
-/// `npm i -g …` into ~/.local when the global npm folder needs root
-/// (e.g. system Node in /usr), so no sudo is needed. Servers then land in
-/// ~/.local/bin, which nib searches.
 fn adjust_npm(cmd: &str, writable: impl FnOnce() -> bool, home: &Path) -> String {
     let npm_global = cmd.starts_with("npm i -g") || cmd.starts_with("npm install -g");
     if npm_global && !cmd.contains("--prefix") && !writable() {

@@ -1,6 +1,3 @@
-//! Editor state and input handling, independent of the terminal so it can be
-//! unit-tested. `ui.rs` draws it; `main.rs` feeds it events.
-
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -13,7 +10,6 @@ use crate::lsp::{char_from_utf16, Item, Lsp, Reply, Severity};
 use crate::config::{self, Config, Keymap, Settings};
 use crate::theme::Theme;
 use crate::tree::Tree;
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
@@ -30,10 +26,8 @@ pub enum After {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Prompt {
-    /// "Save changes?" before doing `After`.
     Unsaved(After),
     Find(String),
-    /// Command palette: filter text and selected row.
     Palette { query: String, sel: usize },
 }
 
@@ -62,16 +56,12 @@ pub enum Cmd {
 }
 
 pub struct Command {
-    /// Name shown in the palette.
     pub name: &'static str,
-    /// Name used in the `[keys]` section of config.nib.
     pub id: &'static str,
-    /// Default shortcuts (config.nib syntax).
     pub keys: &'static [&'static str],
     pub cmd: Cmd,
 }
 
-/// Every action, in the order the palette lists them.
 pub const COMMANDS: &[Command] = &[
     Command { name: "Save file", id: "save", keys: &["ctrl+s"], cmd: Cmd::Save },
     Command { name: "Find in file", id: "find", keys: &["ctrl+f"], cmd: Cmd::Find },
@@ -95,18 +85,14 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "Command palette", id: "palette", keys: &["ctrl+p"], cmd: Cmd::Palette },
 ];
 
-/// A small floating window over the editor.
 pub enum Popup {
     Hover(String),
-    /// Completion list; `start` is where the typed prefix begins.
     Complete { items: Vec<Item>, sel: usize, start: Pos },
 }
 
-/// Where to put the cursor once a file opens.
 #[derive(Clone, Copy)]
 enum Target {
     Char(Pos),
-    /// Line and UTF-16 column, as LSP servers send them.
     Utf16(usize, usize),
 }
 
@@ -118,28 +104,20 @@ pub struct App {
     pub prompt: Option<Prompt>,
     pub status: String,
     pub quit: bool,
-    /// Save automatically after edits, and before switching/closing/quitting.
     pub autosave: bool,
     last_edit: Option<Instant>,
-    /// Buffer version whose auto-save failed; don't retry until the next edit.
     autosave_failed: Option<u64>,
-    /// First visible line and display column of the editor.
     pub scroll: (usize, usize),
-    /// Screen areas from the last draw, used for mouse clicks.
     pub tree_area: Rect,
     pub text_area: Rect,
     clipboard: String,
     last_find: String,
-    /// Highlighter state at the start of each line, for buffer `states_version`.
     states: Vec<State>,
     states_version: Option<u64>,
-    /// Language servers (None until `attach_lsp`, e.g. in unit tests).
     pub lsp: Option<Lsp>,
     pub popup: Option<Popup>,
-    /// Positions to return to with "Go back".
     jumps: Vec<(PathBuf, Pos)>,
     pending_cursor: Option<(PathBuf, Target)>,
-    /// Where a requested completion's prefix starts.
     complete_start: Option<Pos>,
     pub settings: Settings,
     pub theme: Theme,
@@ -147,7 +125,6 @@ pub struct App {
 }
 
 impl App {
-    /// `path` may be a folder, an existing file, or a new file to create.
     pub fn new(path: &Path) -> App {
         let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
         let (root, file) = if path.is_dir() {
@@ -199,9 +176,6 @@ impl App {
         p.strip_prefix(&self.tree.root).unwrap_or(p).display().to_string()
     }
 
-    /// Highlighter state at the start of each line. After an edit only lines
-    /// from the first changed one are redone, stopping as soon as the state
-    /// matches what it was before (so typing costs one line, not the file).
     pub fn line_states(&mut self) -> &[State] {
         let buf = self.buf.as_mut().unwrap();
         let Some(lang) = buf.path.as_deref().and_then(lang_for) else {
@@ -232,7 +206,6 @@ impl App {
         &self.states
     }
 
-    /// Apply a loaded config (at startup and whenever config.nib is saved).
     pub fn apply_config(&mut self, cfg: Config) {
         crate::buffer::set_tab_width(cfg.settings.tab_width);
         self.autosave = cfg.settings.autosave;
@@ -248,7 +221,6 @@ impl App {
         Duration::from_millis(self.settings.autosave_delay)
     }
 
-    /// Start language-server support and register the already-open file.
     pub fn attach_lsp(&mut self, mut lsp: Lsp) {
         if let Some(b) = &self.buf {
             if let Some(p) = &b.path {
@@ -315,7 +287,6 @@ impl App {
         }
     }
 
-    /// Run `after`, asking first if there are unsaved changes.
     fn request(&mut self, after: After) {
         if self.buf.as_ref().is_some_and(|b| b.dirty) && !(self.autosave && self.save()) {
             self.prompt = Some(Prompt::Unsaved(after));
@@ -340,8 +311,6 @@ impl App {
         }
     }
 
-    /// Commands matching the palette filter: every character of `query`
-    /// must appear in order in the name (case-insensitive).
     pub fn palette_matches(query: &str) -> Vec<&'static Command> {
         let q = query.to_lowercase();
         COMMANDS
@@ -432,7 +401,6 @@ impl App {
         self.buf.as_ref().map(|b| b.version)
     }
 
-    /// Restart the auto-save countdown if the last input changed the text.
     fn note_edit(&mut self, before: Option<u64>) {
         if self.version() != before {
             if self.buf.as_ref().is_some_and(|b| b.dirty) {
@@ -444,14 +412,12 @@ impl App {
         }
     }
 
-    /// When the main loop must wake up even without input.
     pub fn next_wake(&self) -> Option<Instant> {
         let save = self.autosave_wait().map(|d| Instant::now() + d);
         let lsp = self.lsp.as_ref().and_then(Lsp::deadline);
         save.into_iter().chain(lsp).min()
     }
 
-    /// A message (or exit) from language server `id`.
     pub fn on_lsp(&mut self, id: usize, msg: Option<serde_json::Value>) {
         let Some(reply) = self.lsp.as_mut().and_then(|l| l.handle(id, msg)) else { return };
         match reply {
@@ -489,7 +455,6 @@ impl App {
         }
     }
 
-    /// Move to a position, opening the file if needed.
     fn goto(&mut self, path: PathBuf, t: Target) {
         let same = self.buf.as_ref().and_then(|b| b.path.as_ref()) == Some(&path);
         if same {
@@ -524,7 +489,6 @@ impl App {
         self.status = format!("{} {}", severity_label(d.severity), d.message);
     }
 
-    /// Completion items matching the typed prefix, and the selected index.
     pub fn completion_view(&self) -> Option<(Vec<&Item>, usize, Pos)> {
         let Some(Popup::Complete { items, sel, start }) = &self.popup else { return None };
         let b = self.buf.as_ref()?;
@@ -537,7 +501,6 @@ impl App {
         Some((v, *sel, *start))
     }
 
-    /// Close the completion popup if the cursor left the word or nothing matches.
     fn refilter(&mut self) {
         let Some((view, sel, start)) = self.completion_view() else { return };
         let b = self.buf.as_ref().unwrap();
@@ -563,7 +526,6 @@ impl App {
         b.replace(from, b.cur, &item.insert);
     }
 
-    /// Keys while a popup is open. Returns true if the key was consumed.
     fn popup_key(&mut self, k: KeyEvent) -> bool {
         match &mut self.popup {
             None => false,
@@ -594,8 +556,6 @@ impl App {
         }
     }
 
-    /// How long until an auto-save is due; `None` when nothing is pending,
-    /// so the main loop can sleep until the next key press.
     pub fn autosave_wait(&self) -> Option<Duration> {
         let b = self.buf.as_ref()?;
         if !self.autosave || !b.dirty || self.autosave_failed == Some(b.version) || self.prompt.is_some() {
@@ -604,7 +564,6 @@ impl App {
         Some(self.autosave_delay().saturating_sub(self.last_edit?.elapsed()))
     }
 
-    /// Called by the main loop when it wakes up: save if the delay has passed.
     pub fn tick(&mut self) {
         if self.autosave_wait() == Some(Duration::ZERO) {
             self.flush();
@@ -614,8 +573,6 @@ impl App {
         }
     }
 
-    /// Save now if auto-save is on and there are changes (e.g. the terminal
-    /// lost focus or nib is exiting).
     pub fn flush(&mut self) {
         let Some(b) = self.buf.as_ref() else { return };
         if self.autosave && b.dirty && self.autosave_failed != Some(b.version) {
@@ -784,7 +741,6 @@ impl App {
         }
     }
 
-    /// Bracketed paste from the terminal: insert verbatim (no auto-indent).
     pub fn on_paste(&mut self, text: &str) {
         if self.prompt.is_some() || self.focus != Focus::Editor {
             return;
@@ -830,7 +786,6 @@ impl App {
         }
     }
 
-    /// Scroll the editor and tree so the cursor/selection is on screen.
     pub fn follow_cursor(&mut self) {
         let h = self.tree_area.height as usize;
         if h > 0 {
@@ -853,7 +808,6 @@ impl App {
     }
 }
 
-/// Start of the identifier the cursor is in or just after.
 fn word_start(b: &Buffer) -> Pos {
     let cs: Vec<char> = b.lines[b.cur.y].chars().collect();
     let mut x = b.cur.x.min(cs.len());
@@ -904,9 +858,9 @@ mod tests {
         let mut app = App::new(&d);
         app.autosave = false;
         assert_eq!(app.focus, Focus::Tree);
-        app.on_key(key(KeyCode::Enter)); // expand src
+        app.on_key(key(KeyCode::Enter));
         app.on_key(key(KeyCode::Down));
-        app.on_key(key(KeyCode::Enter)); // open main.rs
+        app.on_key(key(KeyCode::Enter));
         assert_eq!(app.focus, Focus::Editor);
         typ(&mut app, "// ");
         app.on_key(ctrl('s'));
@@ -931,11 +885,11 @@ mod tests {
         app.autosave = false;
         assert_eq!(app.tree.selected().unwrap().name, "notes.txt");
         typ(&mut app, "A");
-        app.on_key(key(KeyCode::Esc)); // to tree
+        app.on_key(key(KeyCode::Esc));
         app.on_key(key(KeyCode::Home));
-        app.on_key(key(KeyCode::Enter)); // collapse/expand src
+        app.on_key(key(KeyCode::Enter));
         app.on_key(key(KeyCode::Down));
-        app.on_key(key(KeyCode::Enter)); // main.rs
+        app.on_key(key(KeyCode::Enter));
         assert_eq!(app.prompt, Some(Prompt::Unsaved(After::Open(d.join("src/main.rs")))));
         app.on_key(key(KeyCode::Char('y')));
         assert_eq!(fs::read_to_string(d.join("notes.txt")).unwrap(), "Ahi\n");
@@ -986,11 +940,10 @@ mod tests {
         assert!(app.prompt.is_none());
         assert_eq!(fs::read_to_string(d.join("notes.txt")).unwrap(), "Xhi\n");
 
-        // Arrow keys pick a row; typing in the palette never reaches the file.
         app.on_key(ctrl('p'));
         typ(&mut app, "u");
         app.on_key(key(KeyCode::Up));
-        app.on_key(key(KeyCode::Enter)); // "u" matches Undo first
+        app.on_key(key(KeyCode::Enter));
         assert_eq!(app.buf.as_ref().unwrap().text(), "hi\n", "Undo ran");
         app.on_key(ctrl('p'));
         app.on_key(key(KeyCode::Esc));
@@ -1007,7 +960,6 @@ mod tests {
         let mut app = App::new(&p);
         let full = |app: &App| line_states(&app.buf.as_ref().unwrap().lines, lang_for(&p).unwrap());
         app.line_states();
-        // Edits that change later lines' state: open a comment, a string, a tag.
         for (y, text) in [(0, "<!-- "), (4, "`"), (1, "<div "), (7, "/* ")] {
             app.buf.as_mut().unwrap().set_cur(Pos { y, x: 0 });
             app.on_paste(text);
@@ -1036,7 +988,6 @@ mod tests {
         assert_eq!(fs::read_to_string(&notes).unwrap(), "Ahi\n");
         assert!(app.autosave_wait().is_none());
 
-        // Switching files saves first instead of asking.
         typ(&mut app, "B");
         app.on_key(key(KeyCode::Esc));
         app.tree.sel = app.tree.items.iter().position(|e| e.name == "src").unwrap();
@@ -1046,13 +997,11 @@ mod tests {
         assert!(app.prompt.is_none());
         assert_eq!(fs::read_to_string(&notes).unwrap(), "ABhi\n");
 
-        // Quitting saves too.
         typ(&mut app, "//");
         app.on_key(ctrl('q'));
         assert!(app.quit && app.prompt.is_none());
         assert_eq!(fs::read_to_string(d.join("src/main.rs")).unwrap(), "//fn main() {}\n");
 
-        // Undo still works after auto-saves.
         app.on_key(ctrl('z'));
         assert_eq!(app.buf.as_ref().unwrap().text(), "fn main() {}\n");
         fs::remove_dir_all(d).unwrap();

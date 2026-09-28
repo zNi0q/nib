@@ -1,7 +1,3 @@
-//! End-to-end tests: run the real `nib` binary inside tmux, drive it with
-//! keystrokes and bracketed paste, and check both the screen and the files
-//! on disk.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -19,7 +15,6 @@ fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
     false
 }
 
-/// Fresh temp project dir for one test; removed on drop.
 struct Fixture(PathBuf);
 
 impl Fixture {
@@ -38,7 +33,6 @@ impl Fixture {
     fn read(&self, rel: &str) -> String {
         fs::read_to_string(self.0.join(rel)).unwrap_or_default()
     }
-    /// Wait until `rel` on disk equals `want`.
     fn wait_disk(&self, rel: &str, want: &str) {
         let ok = wait_until(Duration::from_secs(5), || self.read(rel) == want);
         assert!(ok, "{rel} on disk: {:?}, want {:?}", self.read(rel), want);
@@ -51,7 +45,6 @@ impl Drop for Fixture {
     }
 }
 
-/// An empty config folder, so tests never load the user's config or plugins.
 fn isolated_config() -> PathBuf {
     let d = std::env::temp_dir().join(format!("nib-e2e-noconfig-{}", std::process::id()));
     fs::create_dir_all(&d).unwrap();
@@ -76,7 +69,6 @@ impl Tmux {
             .success();
         assert!(ok, "tmux failed to start");
         let t = Tmux(name);
-        // Wait for the first frame (the status bar always shows "NIB").
         assert!(wait_until(Duration::from_secs(5), || t.screen().contains("NIB")), "nib never rendered");
         t
     }
@@ -88,7 +80,6 @@ impl Tmux {
         Command::new("tmux").args(["send-keys", "-t", &self.0, "-l", text]).status().unwrap();
         sleep(Duration::from_millis(60));
     }
-    /// Bracketed paste (`paste-buffer -p`), like pasting in a real terminal.
     fn paste(&self, text: &str) {
         let buf = format!("{}-buf", self.0);
         let mut child = Command::new("tmux")
@@ -136,7 +127,6 @@ fn open_folder_edit_save_then_quit_autosaves() {
     t.wait_for("README.md");
     assert!(!t.screen().contains(".git"), ".git should be hidden:\n{}", t.screen());
 
-    // src/ is first (folders first). Expand it, open main.rs.
     t.keys(&["Enter"]);
     t.wait_for("main.rs");
     t.keys(&["Down", "Enter"]);
@@ -149,7 +139,6 @@ fn open_folder_edit_save_then_quit_autosaves() {
     fx.wait_disk("src/main.rs", "// fn main() {}\n");
     assert!(!t.screen().contains("●"), "still marked modified after save:\n{}", t.screen());
 
-    // Quitting right after an edit saves it (auto-save), no prompt.
     t.literal("more");
     t.keys(&["C-q"]);
     t.wait_exit();
@@ -202,7 +191,6 @@ fn switching_files_autosaves_without_prompt() {
     t.literal("1");
     t.wait_for("1alpha");
 
-    // Back to the tree (a.txt is selected), move to b.txt, open it.
     t.keys(&["Escape"]);
     t.keys(&["Down", "Enter"]);
     fx.wait_disk("a.txt", "1alpha\n");
@@ -226,7 +214,6 @@ fn new_file_bracketed_paste_is_verbatim() {
     t.wait_for("Ln 4, Col 13");
     t.keys(&["C-s"]);
     t.wait_for("Saved newfile.py");
-    // New files end with a newline; the pasted indentation must be unchanged.
     fx.wait_disk("newfile.py", &format!("{code}\n"));
     t.wait_for("newfile.py");
 }
@@ -272,11 +259,10 @@ fn binary_file_is_refused() {
 
     let t = Tmux::start("binary", &fx.0, &fx.0);
     t.wait_for("img.bin");
-    t.keys(&["Enter"]); // img.bin is first
+    t.keys(&["Enter"]);
     t.wait_for("Can't open img.bin: binary file");
     assert!(!t.screen().contains("PNG"), "binary contents shown:\n{}", t.screen());
 
-    // No buffer opened, so quitting doesn't ask anything.
     t.keys(&["C-q"]);
     t.wait_exit();
     assert_eq!(fs::read(fx.0.join("img.bin")).unwrap(), bytes, "binary file modified");

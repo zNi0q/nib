@@ -1,6 +1,3 @@
-//! Drawing. Colors are a Tokyo Night–style palette on the terminal's own
-//! background, so nib blends into whatever theme the terminal uses.
-
 use ratatui_core::layout::{Constraint, Layout, Rect};
 use ratatui_core::style::{Color, Modifier, Style};
 use ratatui_core::terminal::Frame;
@@ -33,7 +30,6 @@ fn sev_mark(s: Severity) -> &'static str {
     }
 }
 
-/// Diagnostics of the open file.
 fn diags(app: &App) -> &[Diag] {
     match (&app.lsp, app.buf.as_ref().and_then(|b| b.path.as_ref())) {
         (Some(l), Some(p)) => l.diags_for(p),
@@ -127,7 +123,6 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
         .title(Span::styled(format!(" {root} "), Style::default().fg(th.accent).add_modifier(Modifier::BOLD)));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    // Leave the first row for the title.
     let list = Rect { y: inner.y + 1, height: inner.height.saturating_sub(1), ..inner };
     app.tree_area = list;
     app.follow_cursor();
@@ -195,7 +190,6 @@ fn draw_editor(f: &mut Frame, app: &mut App, area: Rect) {
     let (sy, sx) = app.scroll;
 
     let end = (sy + area.height as usize).min(buf.lines.len());
-    // Worst diagnostic per visible line.
     let mut marks: Vec<Option<Severity>> = vec![None; end - sy];
     for d in diags(app).iter().filter(|d| d.line >= sy && d.line < end) {
         let m = &mut marks[d.line - sy];
@@ -219,7 +213,6 @@ fn draw_editor(f: &mut Frame, app: &mut App, area: Rect) {
             Some(l) => highlight_line(line, l, &mut states.get(y).copied().unwrap_or_default()),
             None => vec![Tok::Text; line.chars().count()],
         };
-        // Expand tabs / control chars into cells, then crop to the view.
         let mut spans: Vec<Span> = Vec::new();
         let mut col = 0;
         for (c, t) in line.chars().zip(toks) {
@@ -362,7 +355,6 @@ fn draw_bottom(f: &mut Frame, app: &App, area: Rect) {
         }
         _ if !app.status.is_empty() => Line::from(Span::styled(format!(" {}", app.status), Style::default().fg(th.text))),
         _ => {
-            // Problem on the cursor line, if any.
             let y = app.buf.as_ref().map(|b| b.cur.y);
             match diags(app).iter().find(|d| Some(d.line) == y) {
                 Some(d) => Line::from(Span::styled(
@@ -376,7 +368,6 @@ fn draw_bottom(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-/// Hover info or the completion list, next to the cursor.
 fn draw_popup(f: &mut Frame, app: &App) {
     let th = app.theme;
     let (Some(popup), Some(b)) = (&app.popup, &app.buf) else { return };
@@ -453,7 +444,6 @@ fn draw_popup(f: &mut Frame, app: &App) {
 mod tests {
     #[test]
     fn screen_cells_stay_small() {
-        // Two full-screen buffers of these are the biggest part of nib's heap.
         assert!(std::mem::size_of::<ratatui_core::buffer::Cell>() <= 40, "underline-color feature crept back in?");
     }
 }

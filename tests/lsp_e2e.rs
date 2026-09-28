@@ -1,8 +1,3 @@
-//! End-to-end LSP tests: run the real `nib` binary in tmux against
-//! `tests/fake_lsp.py` (a small stdio LSP server) configured through a plugin
-//! file in a temp XDG_CONFIG_HOME, and check both the screen and facts on disk
-//! or about the server process.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -26,7 +21,6 @@ fn fake_server() -> String {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_lsp.py").display().to_string()
 }
 
-/// Temp dir with `cfg/` (XDG_CONFIG_HOME) and `proj/` (files to edit).
 struct Fixture(PathBuf);
 
 impl Fixture {
@@ -68,7 +62,6 @@ impl Fixture {
         let ok = wait_until(TIMEOUT, || self.log().lines().any(|l| l == method));
         assert!(ok, "server never received {method}; log:\n{}", self.log());
     }
-    /// Plugin for the fake server, with `extra` TOML lines appended.
     fn fake_plugin(&self, extra: &str) {
         let toml = format!(
             "name = \"fake\"\ncommand = \"python3\"\nargs = [{:?}]\nextensions = [\"fk\"]\n\
@@ -97,7 +90,6 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        // Don't leave a fake server behind if a test failed mid-way.
         for f in [self.pidfile(), self.helper_pidfile()] {
             if let Ok(pid) = fs::read_to_string(f) {
                 let _ = Command::new("kill").args(["-9", pid.trim()]).stderr(Stdio::null()).status();
@@ -148,7 +140,6 @@ impl Tmux {
     fn status_bar(&self) -> String {
         self.screen().lines().find(|l| l.contains("Ln ")).unwrap_or_default().to_string()
     }
-    /// First screen line containing `text`.
     fn line_with(&self, text: &str) -> String {
         self.screen().lines().find(|l| l.contains(text)).unwrap_or_default().to_string()
     }
@@ -164,7 +155,6 @@ impl Tmux {
         let ok = wait_until(TIMEOUT, || self.screen().lines().any(&f));
         assert!(ok, "never saw a line with {what}:\n{}", self.screen());
     }
-    /// Wait until the fake server is initialized (plugin name in the status bar).
     fn wait_exit(&self) {
         let gone = || !Command::new("tmux").args(["has-session", "-t", &self.0]).stderr(Stdio::null()).status().unwrap().success();
         assert!(wait_until(TIMEOUT, gone), "nib did not exit");
@@ -187,9 +177,6 @@ impl Drop for Tmux {
     }
 }
 
-/// The fake server only publishes diagnostics after nib answers its
-/// `workspace/configuration` request, so this test also proves nib replies to
-/// server→client requests.
 #[test]
 fn diagnostics_show_in_gutter_status_and_message() {
     let fx = Fixture::new("diag");
@@ -207,7 +194,6 @@ fn diagnostics_show_in_gutter_status_and_message() {
     t.keys(&["Down"]);
     t.wait_for("error: bad thing here");
 
-    // Add a warning on line 3; it shows after the didChange debounce.
     t.keys(&["Down", "End"]);
     t.literal(" WARN");
     t.wait_line("▲ next to WARN", |l| l.contains("end WARN") && l.contains('▲'));
@@ -217,7 +203,6 @@ fn diagnostics_show_in_gutter_status_and_message() {
     fx.wait_disk("a.fk", "hello\nlet x = BAD\nend WARN\n");
     fx.wait_log("textDocument/didSave");
 
-    // Undo removes it again.
     t.keys(&["C-z"]);
     t.wait_gone("end WARN");
     let ok = wait_until(TIMEOUT, || !t.status_bar().contains("▲ 1") && !t.screen().lines().any(|l| l.contains('▲')));
@@ -263,7 +248,6 @@ fn go_to_definition_back_and_cross_file() {
     t.keys(&["M-Left"]);
     t.wait_for("Ln 1, Col 1");
 
-    // `other` on line 6 jumps into other.fk, line 2 col 4.
     t.keys(&["C-End", "Home"]);
     t.wait_for("Ln 6, Col 1");
     t.keys(&["F12"]);
@@ -286,7 +270,7 @@ fn completion_popup_filters_inserts_and_auto_triggers() {
     t.wait_for(" Complete ");
     t.wait_for("alphabet");
     t.wait_for("beta");
-    t.wait_for("first"); // alpha's detail
+    t.wait_for("first");
     fx.wait_log("textDocument/completion");
 
     t.literal("alphab");
@@ -297,7 +281,6 @@ fn completion_popup_filters_inserts_and_auto_triggers() {
     t.wait_gone(" Complete ");
     fx.wait_disk("c.fk", "alphabet\n");
 
-    // A '.' is a trigger character: the popup opens by itself.
     t.literal(" x.");
     t.wait_for(" Complete ");
     t.wait_for("beta");
@@ -438,7 +421,6 @@ fn closing_the_terminal_saves_and_cleans_up() {
     let (pid, helper) = (fx.server_pid(), fx.helper_pid());
     t.literal("typed ");
     t.wait_for("typed before");
-    // Close the window right away (before the 1 s auto-save): nib gets SIGHUP.
     let _ = Command::new("tmux").args(["kill-session", "-t", &t.0]).status();
     fx.wait_disk("h.fk", "typed before\n");
     let ok = wait_until(Duration::from_secs(3), || !alive(pid) && !alive(helper));

@@ -14,7 +14,6 @@ toml = "1.1.6"
 unicode-width = "0.2.2"
 
 [profile.release]
-# Small binary = fewer code pages in memory.
 opt-level = "z"
 lto = true
 codegen-units = 1

@@ -1,7 +1,3 @@
-//! Text buffer: file loading/saving, cursor movement, edits and undo.
-//! Positions are (line, char index); display columns are computed separately
-//! so tabs and wide characters render correctly.
-
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -10,7 +6,6 @@ use unicode_width::UnicodeWidthChar;
 
 static TAB_WIDTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(4);
 
-/// Tab stop width, from the config (`[editor] tab_width`).
 pub fn tab_width() -> usize {
     TAB_WIDTH.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -47,19 +42,15 @@ pub struct Buffer {
     pub cur: Pos,
     want_col: usize,
     pub dirty: bool,
-    /// Bumped on every change; lets the UI cache per-version work.
     pub version: u64,
-    /// First line touched since the highlighter last looked (usize::MAX = none).
     pub changed_from: usize,
     pub crlf: bool,
     trailing_newline: bool,
-    /// "\t" for files already indented with tabs, otherwise spaces.
     pub indent: &'static str,
     undo: Vec<Edit>,
     redo: Vec<Edit>,
 }
 
-/// Marker for "indent with spaces"; the width comes from `tab_width()`.
 pub const SPACES: &str = "    ";
 
 pub fn byte_idx(s: &str, x: usize) -> usize {
@@ -78,12 +69,10 @@ pub fn char_width(c: char, col: usize) -> usize {
     }
 }
 
-/// Display column of char index `x` in `line`.
 pub fn display_col(line: &str, x: usize) -> usize {
     line.chars().take(x).fold(0, |col, c| col + char_width(c, col))
 }
 
-/// Char index whose cell covers display column `col` (clamped to line end).
 pub fn char_at_col(line: &str, col: usize) -> usize {
     let mut c = 0;
     for (i, ch) in line.chars().enumerate() {
@@ -107,7 +96,6 @@ fn end_of(at: Pos, text: &str) -> Pos {
 }
 
 impl Buffer {
-    /// New, empty buffer. `path` is where it will be saved (may not exist yet).
     pub fn empty(path: Option<PathBuf>) -> Self {
         let mut b = Self::from_text("", path);
         b.trailing_newline = true;
@@ -153,7 +141,6 @@ impl Buffer {
         }
     }
 
-    /// Full file contents exactly as they will be written to disk.
     pub fn text(&self) -> String {
         let mut s = self.lines.join("\n");
         if self.trailing_newline {
@@ -162,8 +149,6 @@ impl Buffer {
         if self.crlf { s.replace('\n', "\r\n") } else { s }
     }
 
-    /// Save atomically: write a temp file next to the target, then rename it
-    /// over the original, so a crash never leaves a half-written file.
     pub fn save(&mut self) -> Result<(), String> {
         let path = self.path.clone().ok_or("no file name")?;
         let target = fs::canonicalize(&path).unwrap_or(path);
@@ -183,7 +168,6 @@ impl Buffer {
         })();
         if let Err(e) = atomic {
             let _ = fs::remove_file(&tmp);
-            // Directory not writable (but the file may be): write in place.
             if e.kind() != std::io::ErrorKind::PermissionDenied {
                 return Err(e.to_string());
             }
@@ -192,8 +176,6 @@ impl Buffer {
         self.dirty = false;
         Ok(())
     }
-
-    // ---- raw edits (no undo bookkeeping) ----
 
     fn raw_insert(&mut self, at: Pos, text: &str) -> Pos {
         let bi = byte_idx(&self.lines[at.y], at.x);
@@ -235,20 +217,16 @@ impl Buffer {
         removed
     }
 
-    // ---- edits with undo ----
-
     fn record(&mut self, e: Edit) {
         self.redo.clear();
         self.dirty = true;
         if let Some(last) = self.undo.last_mut() {
             let single = !e.text.contains('\n') && !last.text.contains('\n');
-            // Consecutive typing becomes one undo step.
             if single && e.kind == Kind::Insert && last.kind == Kind::Insert && last.after == e.at {
                 last.text.push_str(&e.text);
                 last.after = e.after;
                 return;
             }
-            // Consecutive backspaces too.
             if single && e.kind == Kind::Delete && last.kind == Kind::Delete && end_of(e.at, &e.text) == last.at {
                 last.text.insert_str(0, &e.text);
                 last.at = e.at;
@@ -274,7 +252,6 @@ impl Buffer {
         text
     }
 
-    /// Replace the text between `a` and `b` (a <= b) with `text`.
     pub fn replace(&mut self, a: Pos, b: Pos, text: &str) {
         if a < b {
             self.delete(a, b);
@@ -307,8 +284,6 @@ impl Buffer {
         true
     }
 
-    // ---- editing commands ----
-
     pub fn newline(&mut self) {
         let line = &self.lines[self.cur.y];
         let before = &line[..byte_idx(line, self.cur.x)];
@@ -337,7 +312,6 @@ impl Buffer {
         if x > 0 {
             let line = &self.lines[y];
             let before = &line[..byte_idx(line, x)];
-            // In leading spaces, remove back to the previous indent stop.
             let n = if self.indent != "\t" && !before.is_empty() && before.chars().all(|c| c == ' ') {
                 (x - 1) % tab_width() + 1
             } else {
@@ -359,7 +333,6 @@ impl Buffer {
         }
     }
 
-    /// Remove the current line and return it (with trailing newline).
     pub fn cut_line(&mut self) -> String {
         let y = self.cur.y;
         let line = self.lines[y].clone() + "\n";
@@ -377,13 +350,11 @@ impl Buffer {
         line
     }
 
-    /// Insert whole lines above the current line.
     pub fn paste_lines(&mut self, text: &str) {
         self.set_cur(Pos { y: self.cur.y, x: 0 });
         self.insert(text);
     }
 
-    /// Jump to the next occurrence of `q` after the cursor, wrapping around.
     pub fn find_next(&mut self, q: &str) -> bool {
         if q.is_empty() {
             return false;
@@ -403,8 +374,6 @@ impl Buffer {
         }
         false
     }
-
-    // ---- cursor movement ----
 
     pub fn set_cur(&mut self, p: Pos) {
         let y = p.y.min(self.lines.len() - 1);
@@ -444,7 +413,6 @@ impl Buffer {
         self.move_vert(self.cur.y + n);
     }
 
-    /// Toggle between first non-blank character and column 0.
     pub fn home(&mut self) {
         let line = &self.lines[self.cur.y];
         let first = line.chars().take_while(|c| c.is_whitespace()).count();
@@ -554,7 +522,7 @@ mod tests {
         b.redo();
         assert_eq!(b.text(), "abc\n");
         assert_eq!(b.cur, Pos { y: 1, x: 0 });
-        b.backspace(); // joins lines
+        b.backspace();
         b.backspace();
         b.backspace();
         assert_eq!(b.text(), "a");

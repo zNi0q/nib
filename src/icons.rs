@@ -1,6 +1,3 @@
-//! File-type icons (Nerd Font glyphs) and their colors, as in nvim-web-devicons.
-//! Set NIB_NO_ICONS=1 if the terminal font has no Nerd Font glyphs.
-
 use ratatui_core::style::Color;
 
 const fn rgb(hex: u32) -> Color {
@@ -11,7 +8,6 @@ const DEFAULT: (&str, Color) = ("\u{f15b}", rgb(0x6d8086));
 const FOLDER: (&str, Color) = ("\u{f07b}", rgb(0x7aa2f7));
 const FOLDER_OPEN: (&str, Color) = ("\u{f07c}", rgb(0x7aa2f7));
 
-/// Exact file names, checked before extensions.
 static NAMES: &[(&str, &str, u32)] = &[
     ("package.json", "\u{e71e}", 0xcb3837),
     ("package-lock.json", "\u{e71e}", 0x7a0d21),
@@ -105,7 +101,6 @@ pub fn enabled() -> bool {
     std::env::var_os("NIB_NO_ICONS").is_none_or(|v| v.is_empty() || v == "0")
 }
 
-/// Icon glyph and color for a tree entry / file name.
 pub fn icon_for(name: &str, is_dir: bool, expanded: bool) -> (&'static str, Color) {
     if is_dir {
         return if expanded { FOLDER_OPEN } else { FOLDER };

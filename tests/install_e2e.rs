@@ -1,7 +1,3 @@
-//! `nib plugin install` and install.sh, run for real in a sandboxed HOME /
-//! XDG_CONFIG_HOME so nothing on the machine is touched. Network installs are
-//! avoided: servers are faked with small scripts on a private PATH.
-
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -17,7 +13,6 @@ impl Sandbox {
         Sandbox(d)
     }
 
-    /// An executable script in the sandbox's private PATH.
     fn tool(&self, name: &str, script: &str) {
         let p = self.0.join("bin").join(name);
         fs::write(&p, format!("#!/bin/sh\n{script}\n")).unwrap();
@@ -57,7 +52,6 @@ fn install_skips_download_when_server_exists_and_adds_plugin() {
     assert!(out.contains("already installed"), "{out}");
     assert!(out.contains("ready:"), "{out}");
     assert!(fs::read_to_string(sb.plugin("go")).unwrap().contains("gopls"));
-    // Running it again keeps the existing plugin file.
     let (code, out) = sb.nib(&["plugin", "install", "go"]);
     assert_eq!(code, 0, "{out}");
 }
@@ -65,7 +59,6 @@ fn install_skips_download_when_server_exists_and_adds_plugin() {
 #[test]
 fn install_runs_the_install_command_with_the_tool() {
     let sb = Sandbox::new("runs");
-    // A fake `go` that "installs" sqls into ~/go/bin (where real go puts it).
     let gobin = sb.0.join("go/bin");
     sb.tool(
         "go",
@@ -82,11 +75,7 @@ fn install_runs_the_install_command_with_the_tool() {
 #[test]
 fn install_reports_missing_tool_and_unknown_preset() {
     let sb = Sandbox::new("missing");
-    // No npm on this PATH (the real one isn't in the sandbox bin, and we
-    // shadow /usr/bin/npm with a failing stub only if it exists).
     if Path::new("/usr/bin/npm").exists() || Path::new("/bin/npm").exists() {
-        // Can't hide the system npm from PATH; test the failure path via a
-        // failing install command instead.
         sb.tool("npm", "exit 7");
         let (code, out) = sb.nib(&["plugin", "install", "python"]);
         assert_eq!(code, 1, "{out}");
@@ -102,7 +91,6 @@ fn install_reports_missing_tool_and_unknown_preset() {
 #[test]
 fn npm_installs_without_root_go_to_home() {
     let sb = Sandbox::new("npm");
-    // npm whose global prefix is not writable (like system Node in /usr).
     sb.tool(
         "npm",
         &format!(
@@ -133,7 +121,6 @@ fn vue_preset_installs_into_its_own_folder() {
 #[test]
 fn rustup_stand_ins_are_skipped() {
     let sb = Sandbox::new("rustup");
-    // A rustup that knows no rust-analyzer, and its stand-in on PATH.
     sb.tool("rustup", "[ \"$1\" = which ] && exit 1; exit 0");
     std::os::unix::fs::symlink(sb.0.join("bin/rustup"), sb.0.join("bin/rust-analyzer")).unwrap();
     let (_, out) = sb.nib(&["plugin", "add", "rust"]);
@@ -159,9 +146,6 @@ fn install_script_checks_arguments() {
     assert!(out.contains("--lsp needs a value"), "{out}");
 }
 
-/// Full install.sh run: builds and installs nib into a sandbox, creates the
-/// config and installs a (faked) language server. Slow (compiles nib), so
-/// run with `cargo test --release -- --ignored`.
 #[test]
 #[ignore]
 fn install_script_end_to_end() {

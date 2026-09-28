@@ -16,9 +16,6 @@ usage: nib [folder | file]
   nib plugin     manage language-server plugins (list, add, new, remove)
   nib config     create/check the config file (~/.config/nib/config.nib)";
 
-/// SIGHUP (terminal window closed) and SIGTERM (`kill`) become a normal
-/// quit: the handler writes a byte to a pipe, and a watcher thread turns that
-/// into `Wake::Closed`, so auto-save flushes and language servers are stopped.
 mod signals {
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::mpsc::Sender;
@@ -35,13 +32,11 @@ mod signals {
     }
 
     extern "C" fn on_signal(_: i32) {
-        // Only async-signal-safe work here: one write(2).
         unsafe { write(PIPE_WRITE.load(Ordering::Relaxed), [1u8].as_ptr(), 1) };
     }
 
     pub fn watch(tx: Sender<Wake>) {
         let mut fds = [0i32; 2];
-        // SAFETY: plain syscalls; the handler only calls write(2).
         unsafe {
             if pipe(fds.as_mut_ptr()) != 0 {
                 return;
@@ -64,7 +59,6 @@ mod signals {
     }
 }
 
-/// Raw mode + alternate screen, restored on exit and on panic.
 mod terminal {
     use std::io::{stdout, Stdout};
 
@@ -133,8 +127,6 @@ fn main() -> std::io::Result<()> {
 
     let mut term = terminal::enter()?;
 
-    // Keyboard input and language-server messages arrive on one channel, so
-    // the loop sleeps until something happens (or a timer is due).
     let (tx, rx) = mpsc::channel();
     let input = tx.clone();
     signals::watch(tx.clone());
@@ -177,7 +169,6 @@ fn main() -> std::io::Result<()> {
                     Err(_) => break,
                 },
             };
-            // Handle everything already queued before redrawing once.
             for w in first.into_iter().chain(std::iter::from_fn(|| rx.try_recv().ok())) {
                 match w {
                     Wake::Term(Event::Key(k)) if k.kind != KeyEventKind::Release => app.on_key(k),
@@ -196,9 +187,7 @@ fn main() -> std::io::Result<()> {
         }
         Ok(())
     })();
-    // Never lose edits, even if the terminal went away.
     app.flush();
-    // Dropping the client kills every server right away.
     app.lsp = None;
     terminal::leave();
     res
