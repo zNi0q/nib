@@ -71,6 +71,13 @@ the palette.
   `y` save / `n` discard / `Esc` cancel. If a save fails (e.g. read-only file) nib says
   so once and asks before discarding anything.
 
+## File icons
+
+The file tree and status bar show a colored icon per language (Rust, Go, JS, TS, React,
+Vue, Svelte, HTML, CSS/SCSS, Python, SQL, JSON, YAML, TOML, Markdown, Docker, git, …),
+the same glyphs as nvim-web-devicons. They need a [Nerd Font](https://www.nerdfonts.com/)
+in your terminal; if you see boxes instead, run with `NIB_NO_ICONS=1`.
+
 ## Syntax highlighting
 
 Hand-written scanners — no grammar files or regexes — so highlighting costs almost
