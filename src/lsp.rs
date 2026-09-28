@@ -160,11 +160,17 @@ pub struct Lsp {
     next_id: usize,
     doc: Option<Doc>,
     diags: HashMap<PathBuf, Vec<Diag>>,
+    /// Idle timeout for plugins that don't set their own.
+    default_idle: u64,
 }
 
 impl Lsp {
     pub fn new(plugins: Vec<Plugin>, tx: Sender<Wake>) -> Lsp {
-        Lsp { plugins, tx, servers: Vec::new(), next_id: 1, doc: None, diags: HashMap::new() }
+        Lsp { plugins, tx, servers: Vec::new(), next_id: 1, doc: None, diags: HashMap::new(), default_idle: 120 }
+    }
+
+    pub fn set_default_idle(&mut self, secs: u64) {
+        self.default_idle = secs;
     }
 
     fn server(&self, id: usize) -> Option<&Server> {
@@ -274,7 +280,7 @@ impl Lsp {
         let idle = self
             .servers
             .iter()
-            .filter_map(|s| s.idle_since.map(|t| t + Duration::from_secs(s.plugin.idle_timeout)));
+            .filter_map(|s| s.idle_since.map(|t| t + Duration::from_secs(s.plugin.idle_timeout.unwrap_or(self.default_idle))));
         self.doc.as_ref().and_then(|d| d.change_due).into_iter().chain(idle).min()
     }
 
@@ -285,9 +291,12 @@ impl Lsp {
                 self.flush(b);
             }
         }
-        let (idle, keep): (Vec<Server>, Vec<Server>) = std::mem::take(&mut self.servers)
-            .into_iter()
-            .partition(|s| s.idle_since.is_some_and(|t| now >= t + Duration::from_secs(s.plugin.idle_timeout)));
+        let default_idle = self.default_idle;
+        let expired = |s: &Server| {
+            let limit = Duration::from_secs(s.plugin.idle_timeout.unwrap_or(default_idle));
+            s.idle_since.is_some_and(|t| now >= t + limit)
+        };
+        let (idle, keep): (Vec<Server>, Vec<Server>) = std::mem::take(&mut self.servers).into_iter().partition(expired);
         self.servers = keep;
         for s in idle {
             s.stop();
@@ -343,8 +352,10 @@ impl Lsp {
                 // Server → client request: answer so the server never waits on us.
                 let result = match method {
                     "workspace/configuration" => {
-                        let n = msg.pointer("/params/items").and_then(Value::as_array).map_or(0, Vec::len);
-                        Value::Array(vec![Value::Null; n])
+                        // An empty object, not null: some servers crash on null.
+                        let settings = s.plugin.settings.as_ref().and_then(|v| serde_json::to_value(v).ok());
+                        let items = msg.pointer("/params/items").and_then(Value::as_array).cloned().unwrap_or_default();
+                        Value::Array(items.iter().map(|it| config_section(settings.as_ref(), it.get("section").and_then(Value::as_str))).collect())
                     }
                     "workspace/workspaceFolders" => json!([{"uri": path_to_uri(&s.root), "name": "root"}]),
                     _ => Value::Null,
@@ -671,6 +682,20 @@ pub fn parse_locations(v: &Value) -> Vec<Location> {
     }
 }
 
+/// The `section` (dotted path, e.g. "css" or "python.analysis") of a plugin's
+/// settings, or `{}`.
+pub fn config_section(settings: Option<&Value>, section: Option<&str>) -> Value {
+    let mut v = settings;
+    for part in section.unwrap_or("").split('.').filter(|p| !p.is_empty()) {
+        v = v.and_then(|x| x.get(part));
+    }
+    match v {
+        Some(x) if section.is_some() => x.clone(),
+        _ if section.is_none() => settings.cloned().unwrap_or_else(|| json!({})),
+        _ => json!({}),
+    }
+}
+
 /// Hover contents as plain text (markdown code fences dropped).
 pub fn hover_text(v: &Value) -> String {
     fn part(v: &Value) -> String {
@@ -745,6 +770,11 @@ fn strip_snippet(s: &str) -> String {
 
 pub fn parse_completion(v: &Value) -> Vec<Item> {
     let items = v.as_array().or_else(|| v.get("items").and_then(Value::as_array));
+    // LSP 3.17: a shared replace range for items without their own textEdit.
+    let default_start = v
+        .pointer("/itemDefaults/editRange/start")
+        .or_else(|| v.pointer("/itemDefaults/editRange/insert/start"))
+        .and_then(pos);
     let mut out: Vec<(String, Item)> = items
         .map(|a| {
             a.iter()
@@ -757,8 +787,15 @@ pub fn parse_completion(v: &Value) -> Vec<Item> {
                         .or_else(|| it.get("insertText"))
                         .and_then(Value::as_str)
                         .unwrap_or(&label);
+                    let raw = match edit {
+                        None => it.get("textEditText").and_then(Value::as_str).unwrap_or(raw),
+                        Some(_) => raw,
+                    };
                     let insert = if snippet { strip_snippet(raw) } else { raw.to_string() };
-                    let edit_start = edit.and_then(|e| e.pointer("/range/start").or_else(|| e.pointer("/insert/start"))).and_then(pos);
+                    let edit_start = edit
+                        .and_then(|e| e.pointer("/range/start").or_else(|| e.pointer("/insert/start")))
+                        .and_then(pos)
+                        .or(default_start);
                     let str_field = |k: &str| it.get(k).and_then(Value::as_str).map(str::to_string);
                     let sort = str_field("sortText").unwrap_or_else(|| label.clone());
                     let item = Item {
@@ -880,6 +917,19 @@ mod tests {
         assert_eq!(items[2].edit_start, Some((2, 6)));
         assert_eq!(parse_completion(&json!([{"label": "a"}]))[0].insert, "a");
         assert_eq!(strip_snippet(r"a\$b${2}c"), "a$bc");
+        let d = parse_completion(&json!({"itemDefaults": {"editRange": {"start": {"line": 1, "character": 2}, "end": {"line": 1, "character": 4}}},
+                                          "items": [{"label": "color", "textEditText": "color: "}]}));
+        assert_eq!((d[0].edit_start, d[0].insert.as_str()), (Some((1, 2)), "color: "));
+    }
+
+    #[test]
+    fn configuration_answers() {
+        let s = json!({"css": {"validate": true}, "python": {"analysis": {"typeCheckingMode": "basic"}}});
+        assert_eq!(config_section(Some(&s), Some("css")), json!({"validate": true}));
+        assert_eq!(config_section(Some(&s), Some("python.analysis")), json!({"typeCheckingMode": "basic"}));
+        assert_eq!(config_section(Some(&s), Some("missing")), json!({}));
+        assert_eq!(config_section(None, Some("css")), json!({}), "never null");
+        assert_eq!(config_section(Some(&s), None), s);
     }
 
     #[test]

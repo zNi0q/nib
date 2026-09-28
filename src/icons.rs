@@ -66,6 +66,7 @@ static EXTS: &[(&str, &str, u32)] = &[
     ("yml", "\u{e6a8}", 0x6d8086),
     ("toml", "\u{e6b2}", 0x9c4221),
     ("ini", "\u{e615}", 0x6d8086),
+    ("nib", "\u{e615}", 0x7aa2f7),
     ("conf", "\u{e615}", 0x6d8086),
     ("env", "\u{f462}", 0xfaf743),
     ("sh", "\u{e795}", 0x4d5a5e),

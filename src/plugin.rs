@@ -25,14 +25,19 @@ pub struct Plugin {
     /// Files/folders that mark the project root (searched upwards).
     #[serde(default = "default_roots")]
     pub root_markers: Vec<String>,
-    /// Seconds without an open file of this type before the server is stopped.
-    #[serde(default = "default_idle")]
-    pub idle_timeout: u64,
+    /// Seconds without an open file of this type before the server is stopped
+    /// (default: `[lsp] idle_timeout` in config.nib).
+    #[serde(default)]
+    pub idle_timeout: Option<u64>,
     /// Extra environment for the server, e.g. NODE_OPTIONS memory caps.
     #[serde(default)]
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub init_options: Option<toml::Value>,
+    /// Answers to the server's `workspace/configuration` requests, by section,
+    /// e.g. `settings = { css = { validate = true } }`.
+    #[serde(default)]
+    pub settings: Option<toml::Value>,
     #[serde(default = "yes")]
     pub enabled: bool,
     /// Install hint shown when the command isn't found.
@@ -42,9 +47,6 @@ pub struct Plugin {
 
 fn default_roots() -> Vec<String> {
     vec![".git".into()]
-}
-fn default_idle() -> u64 {
-    120
 }
 fn yes() -> bool {
     true
@@ -61,11 +63,7 @@ impl Plugin {
 }
 
 pub fn dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".config"));
-    base.join("nib").join("plugins")
+    crate::config::dir().join("plugins")
 }
 
 fn home() -> PathBuf {
@@ -106,7 +104,33 @@ pub fn resolve_command(cmd: &str) -> Option<PathBuf> {
         h.join(".local/bin"),
     ];
     let path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path).chain(extra).map(|d| d.join(cmd)).find(|c| is_exec(c))
+    std::env::split_paths(&path)
+        .chain(extra)
+        .map(|d| d.join(cmd))
+        .find(|c| is_exec(c) && !(is_rustup_proxy(c) && !rustup_has(cmd)))
+}
+
+/// rustup puts stand-ins for every tool on PATH (e.g. rust-analyzer), even for
+/// components that aren't installed; running one then just prints an error.
+fn is_rustup_proxy(p: &Path) -> bool {
+    if fs::canonicalize(p).is_ok_and(|c| c.file_name().is_some_and(|n| n == "rustup")) {
+        return true;
+    }
+    // ~/.cargo/bin proxies are copies of rustup rather than symlinks.
+    let rustup = p.with_file_name("rustup");
+    match (fs::metadata(p), fs::metadata(&rustup)) {
+        (Ok(a), Ok(b)) => p.file_name().is_some_and(|n| n != "rustup") && a.len() == b.len(),
+        _ => false,
+    }
+}
+
+fn rustup_has(cmd: &str) -> bool {
+    std::process::Command::new("rustup")
+        .args(["which", cmd])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 fn is_exec(p: &Path) -> bool {
@@ -114,12 +138,22 @@ fn is_exec(p: &Path) -> bool {
     fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
+/// Where presets install self-contained servers: $XDG_DATA_HOME/nib (~/.local/share/nib).
+pub fn data_dir() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".local/share"))
+        .join("nib")
+}
+
 // ---------- built-in presets ----------
 
 const NODE_CAP: &str = r#"env = { NODE_OPTIONS = "--max-old-space-size=1024" }"#;
 
 pub fn presets() -> Vec<(&'static str, String)> {
-    let p = |name, body: &str| (name, body.trim_start().replace("{NODE_CAP}", NODE_CAP));
+    let data = data_dir().display().to_string();
+    let p = |name, body: &str| (name, body.trim_start().replace("{NODE_CAP}", NODE_CAP).replace("{DATA}", &data));
     vec![
         p("typescript", r#"
 # TypeScript, JavaScript and React (JSX/TSX), using TypeScript 7's native
@@ -134,16 +168,19 @@ idle_timeout = 120
 install = "npm i -g typescript@latest"
 "#),
         p("vue", r#"
-# Vue single-file components (.vue).
+# Vue single-file components (.vue). Uses Vue language server 2 with its own
+# TypeScript 5 (installed together in one folder): server v3 only works with an
+# editor that also runs tsserver, which TypeScript 7 no longer has.
+# The install needs --allow-git=all because one dependency is fetched from GitHub.
 name = "vue"
-command = "vue-language-server"
+command = "{DATA}/vue/bin/vue-language-server"
 args = ["--stdio"]
 extensions = ["vue"]
 root_markers = ["package.json", ".git"]
 idle_timeout = 120
-init_options = { vue = { hybridMode = false } }
+init_options = { typescript = { tsdk = "{DATA}/vue/lib/node_modules/typescript/lib" }, vue = { hybridMode = false } }
 {NODE_CAP}
-install = "npm i -g @vue/language-server typescript"
+install = "npm i -g --allow-git=all --prefix {DATA}/vue @vue/language-server@2 typescript@5"
 "#),
         p("svelte", r#"
 name = "svelte"
@@ -240,6 +277,8 @@ idle_timeout = 120
 # env = { NODE_OPTIONS = "--max-old-space-size=512" }
 # Sent as initializationOptions:
 # init_options = { }
+# Server settings (answers to workspace/configuration), by section:
+# settings = { mylang = { someOption = true } }
 # Shown when the command is missing:
 # install = "npm i -g ..."
 enabled = true
@@ -291,6 +330,7 @@ pub fn cli(args: &[String]) -> i32 {
             }
             code
         }
+        (Some("install"), Some(_)) => install(&args[1..]),
         (Some("new"), Some(name)) => write_new(&dir, name, &TEMPLATE.replace("{name}", name), "Created"),
         (Some("remove"), Some(name)) => {
             let f = dir.join(format!("{name}.toml"));
@@ -308,10 +348,101 @@ pub fn cli(args: &[String]) -> i32 {
         (Some(cmd @ ("enable" | "disable")), Some(name)) => set_enabled(&dir.join(format!("{name}.toml")), cmd == "enable"),
         _ => {
             eprintln!(
-                "usage: nib plugin [list | presets | path | add <preset>... | new <name> | remove <name> | enable <name> | disable <name>]"
+                "usage: nib plugin [list | presets | path | install <preset>...|all | add <preset>... | new <name> | remove <name> | enable <name> | disable <name>]"
             );
             2
         }
+    }
+}
+
+/// `nib plugin install`: install each server with its preset's command, then
+/// add the plugin file. Returns the exit code (1 if anything failed).
+fn install(names: &[String]) -> i32 {
+    let all = presets();
+    let chosen: Vec<(&str, String)> = if names.iter().any(|n| n == "all") {
+        all.clone()
+    } else {
+        let mut v = Vec::new();
+        for n in names {
+            match all.iter().find(|(p, _)| p == n) {
+                Some(p) => v.push(p.clone()),
+                None => {
+                    eprintln!("Unknown preset {n:?}. Presets: {}", all.iter().map(|p| p.0).collect::<Vec<_>>().join(", "));
+                    return 1;
+                }
+            }
+        }
+        v
+    };
+    let home = home();
+    let mut failed = Vec::new();
+    for (name, body) in chosen {
+        let p: Plugin = toml::from_str(&body).expect("valid preset");
+        println!("==> {name} ({})", p.command);
+        if let Some(found) = resolve_command(&p.command) {
+            println!("    already installed: {}", found.display());
+        } else {
+            let cmd = adjust_npm(p.install.as_deref().unwrap_or_default(), npm_global_writable, &home);
+            let tool = cmd.split_whitespace().next().unwrap_or_default();
+            if resolve_command(tool).is_none() {
+                eprintln!("    needs `{tool}` first: {}", tool_hint(tool));
+                failed.push(name);
+                continue;
+            }
+            println!("    $ {cmd}");
+            let ok = std::process::Command::new("sh").arg("-c").arg(&cmd).status().is_ok_and(|s| s.success());
+            if !ok {
+                eprintln!("    install failed");
+                failed.push(name);
+                continue;
+            }
+        }
+        let f = dir().join(format!("{name}.toml"));
+        if !f.exists() && write_new(&dir(), name, &body, "Added") != 0 {
+            failed.push(name);
+            continue;
+        }
+        match resolve_command(&p.command) {
+            Some(x) => println!("    ready: {}", x.display()),
+            None => println!("    installed, but `{}` isn't on PATH — add its folder to PATH", p.command),
+        }
+    }
+    if failed.is_empty() {
+        0
+    } else {
+        eprintln!("Not installed: {}", failed.join(", "));
+        1
+    }
+}
+
+fn tool_hint(tool: &str) -> &'static str {
+    match tool {
+        "npm" => "install Node.js (https://nodejs.org or your package manager)",
+        "go" => "install Go (https://go.dev/dl or your package manager)",
+        "rustup" => "install Rust with rustup (https://rustup.rs)",
+        _ => "install it with your package manager",
+    }
+}
+
+/// Can npm install globally without root?
+fn npm_global_writable() -> bool {
+    let Ok(out) = std::process::Command::new("npm").args(["prefix", "-g"]).output() else { return false };
+    let prefix = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    let probe = prefix.join("lib").join(".nib-write-test");
+    let ok = fs::create_dir_all(prefix.join("lib")).and_then(|_| fs::write(&probe, "")).is_ok();
+    let _ = fs::remove_file(&probe);
+    ok
+}
+
+/// `npm i -g …` into ~/.local when the global npm folder needs root
+/// (e.g. system Node in /usr), so no sudo is needed. Servers then land in
+/// ~/.local/bin, which nib searches.
+fn adjust_npm(cmd: &str, writable: impl FnOnce() -> bool, home: &Path) -> String {
+    let npm_global = cmd.starts_with("npm i -g") || cmd.starts_with("npm install -g");
+    if npm_global && !cmd.contains("--prefix") && !writable() {
+        format!("{cmd} --prefix {}", home.join(".local").display())
+    } else {
+        cmd.to_string()
     }
 }
 
@@ -375,18 +506,27 @@ mod tests {
             assert!(!p.extensions.is_empty());
         }
         let t: Plugin = toml::from_str(&TEMPLATE.replace("{name}", "x")).unwrap();
-        assert_eq!(t.idle_timeout, 120);
+        assert_eq!(t.idle_timeout, Some(120));
     }
 
     #[test]
     fn defaults_and_language_ids() {
         let p: Plugin = toml::from_str("name='a'\ncommand='a'\nextensions=['ts','x']\nlanguage_ids={ts='typescript'}").unwrap();
         assert_eq!(p.root_markers, [".git"]);
-        assert_eq!(p.idle_timeout, 120);
+        assert_eq!(p.idle_timeout, None, "falls back to [lsp] idle_timeout");
         assert!(p.enabled && p.handles("TS") && !p.handles("rs"));
         assert_eq!(p.language_id("ts"), "typescript");
         assert_eq!(p.language_id("x"), "x");
         assert!(toml::from_str::<Plugin>("name='a'\ncommand='a'\nextensions=[]\ntypo=1").is_err(), "unknown keys are errors");
+    }
+
+    #[test]
+    fn npm_installs_go_to_home_when_global_needs_root() {
+        let h = Path::new("/home/me");
+        assert_eq!(adjust_npm("npm i -g pyright", || false, h), "npm i -g pyright --prefix /home/me/.local");
+        assert_eq!(adjust_npm("npm i -g pyright", || true, h), "npm i -g pyright");
+        assert_eq!(adjust_npm("go install x@latest", || false, h), "go install x@latest");
+        assert_eq!(adjust_npm("npm i -g --prefix /d x", || false, h), "npm i -g --prefix /d x", "own prefix kept");
     }
 
     #[test]

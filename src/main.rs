@@ -18,12 +18,15 @@ usage: nib [folder | file]
   nib            open the current folder
   nib <folder>   open a folder in the file tree
   nib <file>     open a file (creates it on first save if missing)
-  nib plugin     manage language-server plugins (list, add, new, remove)";
+  nib plugin     manage language-server plugins (list, add, new, remove)
+  nib config     create/check the config file (~/.config/nib/config.nib)";
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("plugin") {
-        std::process::exit(nib::plugin::cli(&args[1..]));
+    match args.first().map(String::as_str) {
+        Some("plugin") => std::process::exit(nib::plugin::cli(&args[1..])),
+        Some("config") => std::process::exit(nib::config::cli(&args[1..])),
+        _ => {}
     }
     let arg = args.first().cloned();
     match arg.as_deref() {
@@ -43,6 +46,10 @@ fn main() -> std::io::Result<()> {
         std::process::exit(1);
     }
     let mut app = App::new(&path);
+    let (cfg, config_errors) = nib::config::load();
+    let lsp_enabled = cfg.settings.lsp_enabled;
+    let idle = cfg.settings.lsp_idle_timeout;
+    app.apply_config(cfg);
 
     let mut term = ratatui::init();
     execute!(stdout(), EnableMouseCapture, EnableBracketedPaste, EnableFocusChange)?;
@@ -58,8 +65,14 @@ fn main() -> std::io::Result<()> {
             }
         }
     });
-    let (plugins, warnings) = nib::plugin::load();
-    app.attach_lsp(Lsp::new(plugins, tx));
+    let mut warnings = config_errors;
+    if lsp_enabled {
+        let (plugins, plugin_warnings) = nib::plugin::load();
+        let mut lsp = Lsp::new(plugins, tx);
+        lsp.set_default_idle(idle);
+        app.attach_lsp(lsp);
+        warnings.extend(plugin_warnings);
+    }
     if let Some(w) = warnings.first() {
         app.status = w.clone();
     }

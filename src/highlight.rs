@@ -223,7 +223,7 @@ static LANGS: &[(&[&str], &Lang)] = &[
     (&["vue"], &VUE),
     (&["svelte"], &SVELTE),
     (&["json", "jsonc", "json5"], &JSON),
-    (&["toml", "yaml", "yml", "ini", "conf", "cfg", "env", "mk", "dockerfile", "properties"], &CONFIG),
+    (&["toml", "yaml", "yml", "ini", "conf", "cfg", "env", "mk", "dockerfile", "properties", "nib"], &CONFIG),
     (&["md", "markdown"], &MARKDOWN),
 ];
 

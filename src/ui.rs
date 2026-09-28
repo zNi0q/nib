@@ -14,20 +14,13 @@ use crate::lsp::{Diag, Severity};
 use crate::buffer::{char_width, display_col};
 use crate::highlight::{highlight_line, lang_for, Tok};
 use crate::icons::{self, icon_for};
+use crate::theme::Theme;
 
-const FG: Color = Color::Rgb(192, 202, 245);
-const DIM: Color = Color::Rgb(86, 95, 137);
-const ACCENT: Color = Color::Rgb(122, 162, 247);
-const BAR_BG: Color = Color::Rgb(36, 40, 59);
-const SEL_BG: Color = Color::Rgb(41, 46, 66);
-const WARN: Color = Color::Rgb(224, 175, 104);
-const ERR: Color = Color::Rgb(247, 118, 142);
-
-fn sev_color(s: Severity) -> Color {
+fn sev_color(th: &Theme, s: Severity) -> Color {
     match s {
-        Severity::Error => ERR,
-        Severity::Warning => WARN,
-        _ => ACCENT,
+        Severity::Error => th.error,
+        Severity::Warning => th.warning,
+        _ => th.accent,
     }
 }
 
@@ -47,18 +40,18 @@ fn diags(app: &App) -> &[Diag] {
     }
 }
 
-fn tok_style(t: Tok) -> Style {
+fn tok_style(th: &Theme, t: Tok) -> Style {
     let s = Style::default();
     match t {
-        Tok::Text => s.fg(FG),
-        Tok::Keyword => s.fg(Color::Rgb(187, 154, 247)),
-        Tok::Str => s.fg(Color::Rgb(158, 206, 106)),
-        Tok::Comment => s.fg(DIM).add_modifier(Modifier::ITALIC),
-        Tok::Number => s.fg(Color::Rgb(255, 158, 100)),
-        Tok::Func => s.fg(ACCENT),
-        Tok::Type => s.fg(Color::Rgb(42, 195, 222)),
-        Tok::Tag => s.fg(Color::Rgb(247, 118, 142)),
-        Tok::Attr => s.fg(Color::Rgb(224, 175, 104)),
+        Tok::Text => s.fg(th.text),
+        Tok::Keyword => s.fg(th.keyword),
+        Tok::Str => s.fg(th.string),
+        Tok::Comment => s.fg(th.comment).add_modifier(Modifier::ITALIC),
+        Tok::Number => s.fg(th.number),
+        Tok::Func => s.fg(th.function),
+        Tok::Type => s.fg(th.ty),
+        Tok::Tag => s.fg(th.tag),
+        Tok::Attr => s.fg(th.attribute),
     }
 }
 
@@ -66,7 +59,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let [main, status, bottom] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1), Constraint::Length(1)]).areas(f.area());
     let editor = if app.show_tree {
-        let [tree, editor] = Layout::horizontal([Constraint::Length(32), Constraint::Min(10)]).areas(main);
+        let [tree, editor] = Layout::horizontal([Constraint::Length(app.settings.sidebar_width), Constraint::Min(10)]).areas(main);
         draw_tree(f, app, tree);
         editor
     } else {
@@ -77,45 +70,46 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_status(f, app, status);
     draw_bottom(f, app, bottom);
     if let Some(Prompt::Palette { query, sel }) = &app.prompt {
-        draw_palette(f, query, *sel);
+        draw_palette(f, app, query, *sel);
     } else {
         draw_popup(f, app);
     }
 }
 
-fn draw_palette(f: &mut Frame, query: &str, sel: usize) {
+fn draw_palette(f: &mut Frame, app: &App, query: &str, sel: usize) {
+    let th = &app.theme;
     let matches = App::palette_matches(query);
     let screen = f.area();
     let w = 56.min(screen.width.saturating_sub(4));
     let h = (matches.len().max(1) as u16 + 4).min(screen.height.saturating_sub(2));
     let area = Rect { x: screen.x + (screen.width - w) / 2, y: screen.y + screen.height / 6, width: w, height: h };
     let block = Block::bordered()
-        .border_style(Style::default().fg(ACCENT))
-        .title(Span::styled(" Commands ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+        .border_style(Style::default().fg(th.accent))
+        .title(Span::styled(" Commands ", Style::default().fg(th.accent).add_modifier(Modifier::BOLD)));
     let inner = block.inner(area);
     f.render_widget(Clear, area);
     f.render_widget(block, area);
 
     let input = Line::from(vec![
-        Span::styled(" > ", Style::default().fg(WARN)),
-        Span::styled(query.to_string(), Style::default().fg(FG).add_modifier(Modifier::BOLD)),
+        Span::styled(" > ", Style::default().fg(th.warning)),
+        Span::styled(query.to_string(), Style::default().fg(th.text).add_modifier(Modifier::BOLD)),
     ]);
-    let mut lines = vec![input, Line::from(Span::styled("─".repeat(inner.width as usize), Style::default().fg(DIM)))];
+    let mut lines = vec![input, Line::from(Span::styled("─".repeat(inner.width as usize), Style::default().fg(th.dim)))];
     if matches.is_empty() {
-        lines.push(Line::from(Span::styled(" no matching command", Style::default().fg(DIM))));
+        lines.push(Line::from(Span::styled(" no matching command", Style::default().fg(th.dim))));
     }
     let rows = inner.height.saturating_sub(2) as usize;
     let first = sel.saturating_sub(rows.saturating_sub(1));
     for (i, c) in matches.iter().enumerate().skip(first).take(rows) {
-        let keys = c.shortcut();
+        let keys = app.keymap.label(c.cmd);
         let pad = (inner.width as usize).saturating_sub(c.name.chars().count() + keys.len() + 3);
-        let mut style = Style::default().fg(FG);
+        let mut style = Style::default().fg(th.text);
         if i == sel {
-            style = style.bg(SEL_BG).fg(ACCENT).add_modifier(Modifier::BOLD);
+            style = style.bg(th.selection).fg(th.accent).add_modifier(Modifier::BOLD);
         }
         lines.push(Line::from(vec![
             Span::styled(format!(" {}{}", c.name, " ".repeat(pad)), style),
-            Span::styled(format!("{keys}  "), style.fg(DIM)),
+            Span::styled(format!("{keys}  "), style.fg(th.dim)),
         ]));
     }
     f.render_widget(Paragraph::new(lines), inner);
@@ -123,12 +117,13 @@ fn draw_palette(f: &mut Frame, query: &str, sel: usize) {
 }
 
 fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
+    let th = app.theme;
     let focused = app.focus == Focus::Tree;
     let root = app.tree.root.file_name().map_or("/".into(), |n| n.to_string_lossy().into_owned());
     let block = Block::default()
         .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(if focused { ACCENT } else { DIM }))
-        .title(Span::styled(format!(" {root} "), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+        .border_style(Style::default().fg(if focused { th.accent } else { th.dim }))
+        .title(Span::styled(format!(" {root} "), Style::default().fg(th.accent).add_modifier(Modifier::BOLD)));
     let inner = block.inner(area);
     f.render_widget(block, area);
     // Leave the first row for the title.
@@ -137,7 +132,7 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
     app.follow_cursor();
 
     let open = app.buf.as_ref().and_then(|b| b.path.clone());
-    let show_icons = icons::enabled();
+    let show_icons = app.settings.icons && icons::enabled();
     let lines: Vec<Line> = app
         .tree
         .items
@@ -147,9 +142,9 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
         .take(list.height as usize)
         .map(|(i, e)| {
             let (chevron, name, mut style) = if e.is_dir {
-                (if e.expanded { "▾ " } else { "▸ " }, format!("{}/", e.name), Style::default().fg(ACCENT))
+                (if e.expanded { "▾ " } else { "▸ " }, format!("{}/", e.name), Style::default().fg(th.accent))
             } else {
-                let s = if open.as_ref() == Some(&e.path) { Style::default().fg(WARN) } else { Style::default().fg(FG) };
+                let s = if open.as_ref() == Some(&e.path) { Style::default().fg(th.warning) } else { Style::default().fg(th.text) };
                 ("  ", e.name.clone(), s)
             };
             let mut icon_style = style;
@@ -161,8 +156,8 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
                 String::new()
             };
             if i == app.tree.sel {
-                style = style.bg(SEL_BG).add_modifier(Modifier::BOLD);
-                icon_style = icon_style.bg(SEL_BG);
+                style = style.bg(th.selection).add_modifier(Modifier::BOLD);
+                icon_style = icon_style.bg(th.selection);
                 if focused {
                     style = style.add_modifier(Modifier::REVERSED);
                     icon_style = icon_style.add_modifier(Modifier::REVERSED);
@@ -182,11 +177,13 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_editor(f: &mut Frame, app: &mut App, area: Rect) {
+    let th = app.theme;
     if app.buf.is_none() {
         app.text_area = area;
-        return draw_welcome(f, area);
+        return draw_welcome(f, &app.theme, area);
     }
-    let digits = app.buf.as_ref().unwrap().lines.len().to_string().len().max(3);
+    let numbers = app.settings.line_numbers;
+    let digits = if numbers { app.buf.as_ref().unwrap().lines.len().to_string().len().max(3) } else { 0 };
     let gutter = digits as u16 + 2;
     let text = Rect { x: area.x + gutter, width: area.width.saturating_sub(gutter), ..area };
     app.text_area = text;
@@ -209,11 +206,11 @@ fn draw_editor(f: &mut Frame, app: &mut App, area: Rect) {
         let line = &buf.lines[y];
         let current = y == buf.cur.y;
         let (mark, mark_style) = match marks[y - sy] {
-            Some(sev) => (sev_mark(sev), Style::default().fg(sev_color(sev))),
+            Some(sev) => (sev_mark(sev), Style::default().fg(sev_color(&th, sev))),
             None => (" ", Style::default()),
         };
         gut.push(Line::from(vec![
-            Span::styled(format!("{:>digits$}", y + 1), if current { Style::default().fg(WARN) } else { Style::default().fg(DIM) }),
+            Span::styled(if numbers { format!("{:>digits$}", y + 1) } else { String::new() }, if current { Style::default().fg(th.warning) } else { Style::default().fg(th.dim) }),
             Span::styled(mark, mark_style),
             Span::raw(" "),
         ]));
@@ -232,13 +229,13 @@ fn draw_editor(f: &mut Frame, app: &mut App, area: Rect) {
                 c => c.to_string(),
             };
             if col >= sx && col + w <= sx + text.width as usize {
-                spans.push(Span::styled(shown, tok_style(t)));
+                spans.push(Span::styled(shown, tok_style(&th, t)));
             }
             col += w;
         }
         let mut l = Line::from(spans);
         if current {
-            l = l.style(Style::default().bg(SEL_BG));
+            l = l.style(Style::default().bg(th.selection));
         }
         rows.push(l);
     }
@@ -251,7 +248,7 @@ fn draw_editor(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn draw_welcome(f: &mut Frame, area: Rect) {
+fn draw_welcome(f: &mut Frame, th: &Theme, area: Rect) {
     let logo = [
         "        _ _     ",
         "  _ __ (_) |__  ",
@@ -269,13 +266,13 @@ fn draw_welcome(f: &mut Frame, area: Rect) {
         ("Ctrl+E", "switch tree ↔ editor"),
         ("Ctrl+B", "hide / show tree"),
     ];
-    let mut lines: Vec<Line> = logo.iter().map(|l| Line::from(Span::styled(*l, Style::default().fg(ACCENT)))).collect();
-    lines.push(Line::from(Span::styled("a small editor for code", Style::default().fg(DIM))));
+    let mut lines: Vec<Line> = logo.iter().map(|l| Line::from(Span::styled(*l, Style::default().fg(th.accent)))).collect();
+    lines.push(Line::from(Span::styled("a small editor for code", Style::default().fg(th.dim))));
     lines.push(Line::from(""));
     for (k, d) in keys {
         lines.push(Line::from(vec![
-            Span::styled(format!("{k:>8}  "), Style::default().fg(WARN)),
-            Span::styled(format!("{d:<22}"), Style::default().fg(FG)),
+            Span::styled(format!("{k:>8}  "), Style::default().fg(th.warning)),
+            Span::styled(format!("{d:<22}"), Style::default().fg(th.text)),
         ]));
     }
     let h = lines.len() as u16;
@@ -284,20 +281,21 @@ fn draw_welcome(f: &mut Frame, area: Rect) {
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    let bar = Style::default().bg(BAR_BG).fg(FG);
-    let mode = Span::styled(" NIB ", Style::default().bg(ACCENT).fg(Color::Black).add_modifier(Modifier::BOLD));
+    let th = app.theme;
+    let bar = Style::default().bg(th.bar).fg(th.text);
+    let mode = Span::styled(" NIB ", Style::default().bg(th.accent).fg(Color::Black).add_modifier(Modifier::BOLD));
     let mut left = vec![mode];
     let mut right = String::new();
     if let Some(b) = &app.buf {
         let name = b.path.as_ref().map_or("[no name]".into(), |p| app.rel(p));
-        if icons::enabled() {
+        if app.settings.icons && icons::enabled() {
             let file = b.path.as_ref().and_then(|p| p.file_name()).map_or(String::new(), |n| n.to_string_lossy().into_owned());
             let (glyph, color) = icon_for(&file, false, false);
             left.push(Span::styled(format!(" {glyph}"), bar.fg(color)));
         }
         left.push(Span::styled(format!(" {name}"), bar.add_modifier(Modifier::BOLD)));
         if b.dirty {
-            left.push(Span::styled(" ●", bar.fg(WARN)));
+            left.push(Span::styled(" ●", bar.fg(th.warning)));
         }
         let lang = b.path.as_deref().and_then(lang_for).map_or("Text", |l| l.name);
         right = format!(
@@ -309,7 +307,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             lang
         );
     }
-    left.push(Span::styled("  ^P commands", bar.fg(DIM)));
+    left.push(Span::styled("  ^P commands", bar.fg(th.dim)));
     let (errors, warnings) = diags(app).iter().fold((0, 0), |(e, w), d| match d.severity {
         Severity::Error => (e + 1, w),
         Severity::Warning => (e, w + 1),
@@ -317,26 +315,27 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     });
     let mut lsp_spans = Vec::new();
     if errors > 0 {
-        lsp_spans.push(Span::styled(format!("✖ {errors}  "), bar.fg(ERR)));
+        lsp_spans.push(Span::styled(format!("✖ {errors}  "), bar.fg(th.error)));
     }
     if warnings > 0 {
-        lsp_spans.push(Span::styled(format!("▲ {warnings}  "), bar.fg(WARN)));
+        lsp_spans.push(Span::styled(format!("▲ {warnings}  "), bar.fg(th.warning)));
     }
     if let Some((name, ready)) = app.lsp.as_ref().and_then(|l| l.label()) {
         let text = if ready { format!("{name}  ") } else { format!("{name}…  ") };
-        lsp_spans.push(Span::styled(text, bar.fg(if ready { ACCENT } else { DIM })));
+        lsp_spans.push(Span::styled(text, bar.fg(if ready { th.accent } else { th.dim })));
     }
     let used: usize = lsp_spans.iter().chain(left.iter()).map(|s| s.content.chars().count()).sum();
     let pad = (area.width as usize).saturating_sub(used + right.chars().count());
     left.push(Span::styled(" ".repeat(pad), bar));
     left.extend(lsp_spans);
-    left.push(Span::styled(right, bar.fg(DIM)));
+    left.push(Span::styled(right, bar.fg(th.dim)));
     f.render_widget(Paragraph::new(Line::from(left)).style(bar), area);
 }
 
 fn draw_bottom(f: &mut Frame, app: &App, area: Rect) {
-    let key = Style::default().fg(WARN);
-    let dim = Style::default().fg(DIM);
+    let th = app.theme;
+    let key = Style::default().fg(th.warning);
+    let dim = Style::default().fg(th.dim);
     let line = match &app.prompt {
         Some(Prompt::Unsaved(after)) => {
             let name = app.buf.as_ref().and_then(|b| b.path.as_ref()).map_or("file".into(), |p| app.rel(p));
@@ -346,7 +345,7 @@ fn draw_bottom(f: &mut Frame, app: &App, area: Rect) {
                 After::Open(_) => "switching",
             };
             Line::from(vec![
-                Span::styled(format!(" Save changes to {name} before {then}? "), Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" Save changes to {name} before {then}? "), Style::default().fg(th.warning).add_modifier(Modifier::BOLD)),
                 Span::styled("y", key), Span::styled(" save  ", dim),
                 Span::styled("n", key), Span::styled(" discard  ", dim),
                 Span::styled("Esc", key), Span::styled(" cancel", dim),
@@ -356,18 +355,18 @@ fn draw_bottom(f: &mut Frame, app: &App, area: Rect) {
             f.set_cursor_position((area.x + 7 + q.chars().count() as u16, area.y));
             Line::from(vec![
                 Span::styled(" Find: ", key),
-                Span::styled(q.clone(), Style::default().fg(FG)),
+                Span::styled(q.clone(), Style::default().fg(th.text)),
                 Span::styled("   Enter next · Esc close", dim),
             ])
         }
-        _ if !app.status.is_empty() => Line::from(Span::styled(format!(" {}", app.status), Style::default().fg(FG))),
+        _ if !app.status.is_empty() => Line::from(Span::styled(format!(" {}", app.status), Style::default().fg(th.text))),
         _ => {
             // Problem on the cursor line, if any.
             let y = app.buf.as_ref().map(|b| b.cur.y);
             match diags(app).iter().find(|d| Some(d.line) == y) {
                 Some(d) => Line::from(Span::styled(
                     format!(" {} {}", severity_label(d.severity), d.message),
-                    Style::default().fg(sev_color(d.severity)),
+                    Style::default().fg(sev_color(&th, d.severity)),
                 )),
                 None => Line::from(""),
             }
@@ -378,6 +377,7 @@ fn draw_bottom(f: &mut Frame, app: &App, area: Rect) {
 
 /// Hover info or the completion list, next to the cursor.
 fn draw_popup(f: &mut Frame, app: &App) {
+    let th = app.theme;
     let (Some(popup), Some(b)) = (&app.popup, &app.buf) else { return };
     let text = app.text_area;
     let (sy, sx) = app.scroll;
@@ -397,7 +397,7 @@ fn draw_popup(f: &mut Frame, app: &App) {
                     lines.push(Line::from(""));
                 }
                 for chunk in cs.chunks(inner) {
-                    lines.push(Line::from(Span::styled(chunk.iter().collect::<String>(), Style::default().fg(FG))));
+                    lines.push(Line::from(Span::styled(chunk.iter().collect::<String>(), Style::default().fg(th.text))));
                 }
             }
             lines.truncate(14);
@@ -416,16 +416,16 @@ fn draw_popup(f: &mut Frame, app: &App) {
                 .skip(first)
                 .take(rows)
                 .map(|(i, it)| {
-                    let mut st = Style::default().fg(FG);
+                    let mut st = Style::default().fg(th.text);
                     if i == sel {
-                        st = st.bg(SEL_BG).fg(ACCENT).add_modifier(Modifier::BOLD);
+                        st = st.bg(th.selection).fg(th.accent).add_modifier(Modifier::BOLD);
                     }
                     let label: String = it.label.chars().take(label_w).collect();
                     let detail: String = it.detail.chars().take(w.saturating_sub(label_w + 5)).collect();
                     let pad = (w - 2).saturating_sub(label.chars().count() + detail.chars().count() + 2);
                     Line::from(vec![
                         Span::styled(format!(" {label}{}", " ".repeat(pad)), st),
-                        Span::styled(format!("{detail} "), st.fg(DIM)),
+                        Span::styled(format!("{detail} "), st.fg(th.dim)),
                     ])
                 })
                 .collect();
@@ -441,8 +441,8 @@ fn draw_popup(f: &mut Frame, app: &App) {
     f.render_widget(
         Paragraph::new(lines).block(
             Block::bordered()
-                .border_style(Style::default().fg(ACCENT))
-                .title(Span::styled(title, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
+                .border_style(Style::default().fg(th.accent))
+                .title(Span::styled(title, Style::default().fg(th.accent).add_modifier(Modifier::BOLD))),
         ),
         area,
     );

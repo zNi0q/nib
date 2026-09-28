@@ -8,7 +8,16 @@ use std::path::{Path, PathBuf};
 
 use unicode_width::UnicodeWidthChar;
 
-pub const TAB_WIDTH: usize = 4;
+static TAB_WIDTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(4);
+
+/// Tab stop width, from the config (`[editor] tab_width`).
+pub fn tab_width() -> usize {
+    TAB_WIDTH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_tab_width(n: usize) {
+    TAB_WIDTH.store(n.max(1), std::sync::atomic::Ordering::Relaxed);
+}
 const MAX_FILE: u64 = 50 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -50,6 +59,9 @@ pub struct Buffer {
     redo: Vec<Edit>,
 }
 
+/// Marker for "indent with spaces"; the width comes from `tab_width()`.
+pub const SPACES: &str = "    ";
+
 pub fn byte_idx(s: &str, x: usize) -> usize {
     s.char_indices().nth(x).map_or(s.len(), |(i, _)| i)
 }
@@ -60,7 +72,7 @@ pub fn char_len(s: &str) -> usize {
 
 pub fn char_width(c: char, col: usize) -> usize {
     match c {
-        '\t' => TAB_WIDTH - col % TAB_WIDTH,
+        '\t' => tab_width() - col % tab_width(),
         c if c.is_control() => 1,
         c => c.width().unwrap_or(1),
     }
@@ -124,7 +136,7 @@ impl Buffer {
         let trailing_newline = text.ends_with('\n');
         let body = if trailing_newline { &text[..text.len() - 1] } else { &text[..] };
         let lines: Vec<String> = body.split('\n').map(String::from).collect();
-        let indent = if lines.iter().any(|l| l.starts_with('\t')) { "\t" } else { "    " };
+        let indent = if lines.iter().any(|l| l.starts_with('\t')) { "\t" } else { SPACES };
         Buffer {
             lines,
             path,
@@ -302,7 +314,11 @@ impl Buffer {
         let before = &line[..byte_idx(line, self.cur.x)];
         let mut indent: String = before.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
         if before.trim_end().ends_with(['{', '(', '[']) {
-            indent.push_str(self.indent);
+            if self.indent == "\t" {
+                indent.push('\t');
+            } else {
+                indent.push_str(&" ".repeat(tab_width()));
+            }
         }
         self.insert(&format!("\n{indent}"));
     }
@@ -312,7 +328,7 @@ impl Buffer {
             self.insert("\t");
         } else {
             let col = display_col(&self.lines[self.cur.y], self.cur.x);
-            self.insert(&" ".repeat(TAB_WIDTH - col % TAB_WIDTH));
+            self.insert(&" ".repeat(tab_width() - col % tab_width()));
         }
     }
 
@@ -323,7 +339,7 @@ impl Buffer {
             let before = &line[..byte_idx(line, x)];
             // In leading spaces, remove back to the previous indent stop.
             let n = if self.indent != "\t" && !before.is_empty() && before.chars().all(|c| c == ' ') {
-                (x - 1) % TAB_WIDTH + 1
+                (x - 1) % tab_width() + 1
             } else {
                 1
             };

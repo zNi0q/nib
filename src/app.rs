@@ -10,10 +10,10 @@ use ratatui::layout::Rect;
 use crate::buffer::{char_at_col, display_col, Buffer, Pos};
 use crate::highlight::{highlight_line, lang_for, State};
 use crate::lsp::{char_from_utf16, Item, Lsp, Reply, Severity};
+use crate::config::{self, Config, Keymap, Settings};
+use crate::theme::Theme;
 use crate::tree::Tree;
 
-/// Auto-save runs this long after the last edit.
-pub const AUTOSAVE_DELAY: Duration = Duration::from_millis(1000);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
@@ -62,47 +62,37 @@ pub enum Cmd {
 }
 
 pub struct Command {
+    /// Name shown in the palette.
     pub name: &'static str,
-    /// Ctrl+<key> shortcut, if any.
-    pub ctrl: Option<char>,
-    /// Other shortcut, for display (handled in `handle_key`).
-    pub key: Option<&'static str>,
+    /// Name used in the `[keys]` section of config.nib.
+    pub id: &'static str,
+    /// Default shortcuts (config.nib syntax).
+    pub keys: &'static [&'static str],
     pub cmd: Cmd,
-}
-
-impl Command {
-    pub fn shortcut(&self) -> String {
-        match (self.ctrl, self.key) {
-            (Some(' '), _) => "Ctrl+Space".into(),
-            (Some(c), _) => format!("Ctrl+{}", c.to_ascii_uppercase()),
-            (None, Some(k)) => k.into(),
-            (None, None) => String::new(),
-        }
-    }
 }
 
 /// Every action, in the order the palette lists them.
 pub const COMMANDS: &[Command] = &[
-    Command { name: "Save file", ctrl: Some('s'), key: None, cmd: Cmd::Save },
-    Command { name: "Find in file", ctrl: Some('f'), key: None, cmd: Cmd::Find },
-    Command { name: "Go to definition", ctrl: None, key: Some("F12"), cmd: Cmd::Definition },
-    Command { name: "Go back", ctrl: None, key: Some("Alt+←"), cmd: Cmd::Back },
-    Command { name: "Show hover info", ctrl: None, key: Some("F1"), cmd: Cmd::Hover },
-    Command { name: "Complete", ctrl: Some(' '), key: None, cmd: Cmd::Complete },
-    Command { name: "Next problem", ctrl: None, key: Some("F8"), cmd: Cmd::NextProblem },
-    Command { name: "Undo", ctrl: Some('z'), key: None, cmd: Cmd::Undo },
-    Command { name: "Redo", ctrl: Some('y'), key: None, cmd: Cmd::Redo },
-    Command { name: "Cut line", ctrl: Some('k'), key: None, cmd: Cmd::CutLine },
-    Command { name: "Paste line", ctrl: Some('u'), key: None, cmd: Cmd::PasteLine },
-    Command { name: "Switch tree / editor", ctrl: Some('e'), key: None, cmd: Cmd::SwitchFocus },
-    Command { name: "Toggle sidebar", ctrl: Some('b'), key: None, cmd: Cmd::ToggleSidebar },
-    Command { name: "Refresh file tree", ctrl: Some('r'), key: None, cmd: Cmd::Refresh },
-    Command { name: "Toggle auto-save", ctrl: None, key: None, cmd: Cmd::ToggleAutosave },
-    Command { name: "LSP: status", ctrl: None, key: None, cmd: Cmd::LspStatus },
-    Command { name: "LSP: restart servers", ctrl: None, key: None, cmd: Cmd::LspRestart },
-    Command { name: "Close file", ctrl: Some('w'), key: None, cmd: Cmd::Close },
-    Command { name: "Quit nib", ctrl: Some('q'), key: None, cmd: Cmd::Quit },
-    Command { name: "Command palette", ctrl: Some('p'), key: None, cmd: Cmd::Palette },
+    Command { name: "Save file", id: "save", keys: &["ctrl+s"], cmd: Cmd::Save },
+    Command { name: "Find in file", id: "find", keys: &["ctrl+f"], cmd: Cmd::Find },
+    Command { name: "Go to definition", id: "definition", keys: &["f12"], cmd: Cmd::Definition },
+    Command { name: "Go back", id: "back", keys: &["alt+left"], cmd: Cmd::Back },
+    Command { name: "Show hover info", id: "hover", keys: &["f1"], cmd: Cmd::Hover },
+    Command { name: "Complete", id: "complete", keys: &["ctrl+space"], cmd: Cmd::Complete },
+    Command { name: "Next problem", id: "next_problem", keys: &["f8"], cmd: Cmd::NextProblem },
+    Command { name: "Undo", id: "undo", keys: &["ctrl+z"], cmd: Cmd::Undo },
+    Command { name: "Redo", id: "redo", keys: &["ctrl+y"], cmd: Cmd::Redo },
+    Command { name: "Cut line", id: "cut_line", keys: &["ctrl+k"], cmd: Cmd::CutLine },
+    Command { name: "Paste line", id: "paste_line", keys: &["ctrl+u"], cmd: Cmd::PasteLine },
+    Command { name: "Switch tree / editor", id: "switch_focus", keys: &["ctrl+e"], cmd: Cmd::SwitchFocus },
+    Command { name: "Toggle sidebar", id: "toggle_sidebar", keys: &["ctrl+b"], cmd: Cmd::ToggleSidebar },
+    Command { name: "Refresh file tree", id: "refresh", keys: &["ctrl+r"], cmd: Cmd::Refresh },
+    Command { name: "Toggle auto-save", id: "toggle_autosave", keys: &[], cmd: Cmd::ToggleAutosave },
+    Command { name: "LSP: status", id: "lsp_status", keys: &[], cmd: Cmd::LspStatus },
+    Command { name: "LSP: restart servers", id: "lsp_restart", keys: &[], cmd: Cmd::LspRestart },
+    Command { name: "Close file", id: "close", keys: &["ctrl+w"], cmd: Cmd::Close },
+    Command { name: "Quit nib", id: "quit", keys: &["ctrl+q"], cmd: Cmd::Quit },
+    Command { name: "Command palette", id: "palette", keys: &["ctrl+p"], cmd: Cmd::Palette },
 ];
 
 /// A small floating window over the editor.
@@ -151,6 +141,9 @@ pub struct App {
     pending_cursor: Option<(PathBuf, Target)>,
     /// Where a requested completion's prefix starts.
     complete_start: Option<Pos>,
+    pub settings: Settings,
+    pub theme: Theme,
+    pub keymap: Keymap,
 }
 
 impl App {
@@ -185,6 +178,9 @@ impl App {
             jumps: Vec::new(),
             pending_cursor: None,
             complete_start: None,
+            settings: Settings::default(),
+            theme: crate::theme::TOKYONIGHT,
+            keymap: Keymap::defaults(),
         };
         if let Some(f) = file {
             if f.exists() {
@@ -236,6 +232,22 @@ impl App {
         &self.states
     }
 
+    /// Apply a loaded config (at startup and whenever config.nib is saved).
+    pub fn apply_config(&mut self, cfg: Config) {
+        crate::buffer::set_tab_width(cfg.settings.tab_width);
+        self.autosave = cfg.settings.autosave;
+        if let Some(l) = self.lsp.as_mut() {
+            l.set_default_idle(cfg.settings.lsp_idle_timeout);
+        }
+        self.settings = cfg.settings;
+        self.theme = cfg.theme;
+        self.keymap = cfg.keymap;
+    }
+
+    pub fn autosave_delay(&self) -> Duration {
+        Duration::from_millis(self.settings.autosave_delay)
+    }
+
     /// Start language-server support and register the already-open file.
     pub fn attach_lsp(&mut self, mut lsp: Lsp) {
         if let Some(b) = &self.buf {
@@ -284,6 +296,12 @@ impl App {
                 self.status = format!("Saved {name}");
                 if let (Some(l), Some(b)) = (self.lsp.as_mut(), self.buf.as_ref()) {
                     l.saved(b);
+                }
+                let saved = self.buf.as_ref().and_then(|b| b.path.as_deref()).and_then(|p| std::fs::canonicalize(p).ok());
+                if saved.is_some() && saved == std::fs::canonicalize(config::path()).ok() {
+                    let (cfg, errs) = config::load();
+                    self.apply_config(cfg);
+                    self.status = errs.into_iter().next().unwrap_or_else(|| "Config reloaded".into());
                 }
                 if is_new {
                     self.tree.refresh();
@@ -583,7 +601,7 @@ impl App {
         if !self.autosave || !b.dirty || self.autosave_failed == Some(b.version) || self.prompt.is_some() {
             return None;
         }
-        Some(AUTOSAVE_DELAY.saturating_sub(self.last_edit?.elapsed()))
+        Some(self.autosave_delay().saturating_sub(self.last_edit?.elapsed()))
     }
 
     /// Called by the main loop when it wakes up: save if the delay has passed.
@@ -623,23 +641,12 @@ impl App {
         if self.popup_key(k) {
             return;
         }
-        match k.code {
-            KeyCode::F(12) => return self.exec(Cmd::Definition),
-            KeyCode::F(1) => return self.exec(Cmd::Hover),
-            KeyCode::F(8) => return self.exec(Cmd::NextProblem),
-            KeyCode::Left if k.modifiers.contains(KeyModifiers::ALT) => return self.exec(Cmd::Back),
-            _ => {}
+        if let Some(cmd) = self.keymap.lookup(&k) {
+            return self.exec(cmd);
         }
-        if k.modifiers.contains(KeyModifiers::CONTROL) {
-            if let KeyCode::Char(c) = k.code {
-                if let Some(cmd) = COMMANDS.iter().find(|cmd| cmd.ctrl == Some(c)) {
-                    return self.exec(cmd.cmd);
-                }
-                if c == 'c' {
-                    self.status = "Use Ctrl+Q to quit".into();
-                    return;
-                }
-            }
+        if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
+            self.status = format!("Use {} to quit", self.keymap.label(Cmd::Quit));
+            return;
         }
         match self.focus {
             Focus::Tree => self.tree_key(k),
@@ -1021,10 +1028,10 @@ mod tests {
         assert!(app.autosave_wait().is_none(), "nothing pending when clean");
         typ(&mut app, "A");
         let wait = app.autosave_wait().unwrap();
-        assert!(wait > Duration::ZERO && wait <= AUTOSAVE_DELAY);
+        assert!(wait > Duration::ZERO && wait <= app.autosave_delay());
         app.tick();
         assert_eq!(fs::read_to_string(&notes).unwrap(), "hi\n", "not before the delay");
-        std::thread::sleep(AUTOSAVE_DELAY);
+        std::thread::sleep(app.autosave_delay());
         app.tick();
         assert_eq!(fs::read_to_string(&notes).unwrap(), "Ahi\n");
         assert!(app.autosave_wait().is_none());
