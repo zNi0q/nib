@@ -1,7 +1,7 @@
 //! Color themes. Backgrounds stay the terminal's own except for bars and the
 //! selection, so nib blends into the terminal theme.
 
-use ratatui::style::Color;
+use ratatui_core::style::Color;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Theme {

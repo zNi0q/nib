@@ -10,6 +10,20 @@
 # Run it from a clone of the repo, or anywhere with NIB_REPO=<git url>.
 set -eu
 
+usage() {
+    cat <<'USAGE'
+nib installer: builds nib, creates its config and installs language servers.
+Works on Linux and macOS (and WSL).
+
+  ./install.sh                         asks which language servers to install
+  ./install.sh --lsp typescript,python
+  ./install.sh --lsp all               every preset
+  ./install.sh --no-lsp                just nib
+
+Run it from a clone of the repo, or anywhere with NIB_REPO=<git url>.
+USAGE
+}
+
 LSP=""
 ASK=1
 for arg in "$@"; do
@@ -17,7 +31,7 @@ for arg in "$@"; do
         --lsp=*) LSP="${arg#--lsp=}"; ASK=0 ;;
         --lsp) ASK=0; LSP="__next__" ;;
         --no-lsp) LSP=""; ASK=0 ;;
-        -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+        -h|--help) usage; exit 0 ;;
         *)
             if [ "$LSP" = "__next__" ]; then LSP="$arg"; else echo "unknown option: $arg" >&2; exit 2; fi ;;
     esac
@@ -40,14 +54,27 @@ if ! command -v cargo >/dev/null 2>&1; then
     die "Rust is needed to build nib. Install it from https://rustup.rs, then run this again."
 fi
 
+# On Linux build a static musl binary: no shared libc to load, about half the memory.
+target_args=""
+if [ "$(uname -s)" = Linux ] && command -v rustup >/dev/null 2>&1; then
+    musl="$(uname -m)-unknown-linux-musl"
+    if rustup target add "$musl" >/dev/null 2>&1; then
+        target_args="--target $musl"
+    else
+        echo "Could not add the $musl target; building a regular binary instead."
+    fi
+fi
+
 # Build and install nib.
 here="$(cd "$(dirname "$0")" && pwd)"
 if [ -f "$here/Cargo.toml" ] && grep -q '^name = "nib"' "$here/Cargo.toml"; then
     say "Building nib from $here"
-    cargo install --quiet --locked --path "$here"
+    # shellcheck disable=SC2086 # target_args is empty or two words
+    cargo install --quiet --locked $target_args --path "$here"
 elif [ -n "${NIB_REPO:-}" ]; then
     say "Building nib from $NIB_REPO"
-    cargo install --quiet --locked --git "$NIB_REPO" nib
+    # shellcheck disable=SC2086
+    cargo install --quiet --locked $target_args --git "$NIB_REPO" nib
 else
     die "run this script from the nib repo, or set NIB_REPO to its git URL"
 fi

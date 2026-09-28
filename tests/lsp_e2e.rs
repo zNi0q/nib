@@ -80,6 +80,14 @@ impl Fixture {
         );
         fs::write(self.cfg().join("nib/plugins/fake.toml"), toml).unwrap();
     }
+    fn helper_pidfile(&self) -> PathBuf {
+        self.0.join("server.pid.helper")
+    }
+    fn helper_pid(&self) -> u32 {
+        let ok = wait_until(TIMEOUT, || fs::read_to_string(self.helper_pidfile()).is_ok_and(|s| s.trim().parse::<u32>().is_ok()));
+        assert!(ok, "fake server never started its helper");
+        fs::read_to_string(self.helper_pidfile()).unwrap().trim().parse().unwrap()
+    }
     fn server_pid(&self) -> u32 {
         let ok = wait_until(TIMEOUT, || fs::read_to_string(self.pidfile()).is_ok_and(|s| s.trim().parse::<u32>().is_ok()));
         assert!(ok, "fake server never started (no pidfile)");
@@ -90,8 +98,10 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         // Don't leave a fake server behind if a test failed mid-way.
-        if let Ok(pid) = fs::read_to_string(self.pidfile()) {
-            let _ = Command::new("kill").arg(pid.trim()).stderr(Stdio::null()).status();
+        for f in [self.pidfile(), self.helper_pidfile()] {
+            if let Ok(pid) = fs::read_to_string(f) {
+                let _ = Command::new("kill").args(["-9", pid.trim()]).stderr(Stdio::null()).status();
+            }
         }
         let _ = fs::remove_dir_all(&self.0);
     }
@@ -155,6 +165,10 @@ impl Tmux {
         assert!(ok, "never saw a line with {what}:\n{}", self.screen());
     }
     /// Wait until the fake server is initialized (plugin name in the status bar).
+    fn wait_exit(&self) {
+        let gone = || !Command::new("tmux").args(["has-session", "-t", &self.0]).stderr(Stdio::null()).status().unwrap().success();
+        assert!(wait_until(TIMEOUT, gone), "nib did not exit");
+    }
     fn wait_ready(&self) {
         let ok = wait_until(TIMEOUT, || self.status_bar().contains("fake"));
         assert!(ok, "server never became ready:\n{}", self.screen());
@@ -306,9 +320,10 @@ fn idle_server_is_stopped_after_file_closes() {
     t.wait_for(&format!("LSP: fake (pid {pid},"));
     t.wait_for(" MB)");
 
+    let helper = fx.helper_pid();
     t.keys(&["C-w"]);
-    let ok = wait_until(Duration::from_secs(6), || !alive(pid));
-    assert!(ok, "server {pid} still running after the file closed");
+    let ok = wait_until(Duration::from_secs(6), || !alive(pid) && !alive(helper));
+    assert!(ok, "server {pid} or its helper {helper} still running after the file closed");
     fx.wait_log("textDocument/didClose");
     fx.wait_log("shutdown");
 
@@ -378,4 +393,56 @@ fn plugin_cli_add_list_remove_new() {
     let (ok, out) = nib_cli(&fx, &["plugin", "new", "mylang"]);
     assert!(ok, "{out}");
     assert!(plugins.join("mylang.toml").exists(), "{out}");
+}
+
+#[test]
+fn quitting_stops_servers_and_their_helpers() {
+    let fx = Fixture::new("quit");
+    fx.fake_plugin("");
+    let f = fx.write("q.fk", "quit\n");
+    let t = Tmux::start("quit", &fx, &f);
+    t.wait_ready();
+    let (pid, helper) = (fx.server_pid(), fx.helper_pid());
+    assert!(alive(pid) && alive(helper));
+    t.keys(&["C-q"]);
+    t.wait_exit();
+    let ok = wait_until(Duration::from_secs(2), || !alive(pid) && !alive(helper));
+    assert!(ok, "left running after quit: server {pid} alive={} helper {helper} alive={}", alive(pid), alive(helper));
+    fx.wait_log("shutdown");
+}
+
+#[test]
+fn stubborn_server_is_force_stopped_on_quit() {
+    let fx = Fixture::new("stubborn");
+    fx.fake_plugin("");
+    fs::write(fx.0.join("server.pid.stubborn"), "").unwrap();
+    let f = fx.write("s.fk", "stubborn\n");
+    let t = Tmux::start("stubborn", &fx, &f);
+    t.wait_ready();
+    let (pid, helper) = (fx.server_pid(), fx.helper_pid());
+    let start = std::time::Instant::now();
+    t.keys(&["C-q"]);
+    t.wait_exit();
+    assert!(start.elapsed() < Duration::from_secs(3), "quit took {:?}", start.elapsed());
+    let ok = wait_until(Duration::from_secs(2), || !alive(pid) && !alive(helper));
+    assert!(ok, "stubborn server {pid} or helper {helper} survived quit");
+}
+
+#[test]
+fn closing_the_terminal_saves_and_cleans_up() {
+    let fx = Fixture::new("hangup");
+    fx.fake_plugin("");
+    let f = fx.write("h.fk", "before\n");
+    let t = Tmux::start("hangup", &fx, &f);
+    t.wait_ready();
+    let (pid, helper) = (fx.server_pid(), fx.helper_pid());
+    t.literal("typed ");
+    t.wait_for("typed before");
+    // Close the window right away (before the 1 s auto-save): nib gets SIGHUP.
+    let _ = Command::new("tmux").args(["kill-session", "-t", &t.0]).status();
+    fx.wait_disk("h.fk", "typed before\n");
+    let ok = wait_until(Duration::from_secs(3), || !alive(pid) && !alive(helper));
+    assert!(ok, "left running after the terminal closed: server {pid} helper {helper}");
+    let nib_running = || !Command::new("pgrep").args(["-f", &f.display().to_string()]).output().unwrap().stdout.is_empty();
+    assert!(wait_until(Duration::from_secs(5), || !nib_running()), "nib still running 5 s after the terminal closed");
 }

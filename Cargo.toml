@@ -5,8 +5,18 @@ edition = "2024"
 
 [dependencies]
 crossterm = "0.29"
-ratatui = "0.30"
+ratatui-core = { version = "0.1", default-features = false, features = ["std"] }
+ratatui-crossterm = { version = "0.1", default-features = false, features = ["crossterm_0_29"] }
+ratatui-widgets = { version = "0.3", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 toml = "1.1.6"
 unicode-width = "0.2.2"
+
+[profile.release]
+# Small binary = fewer code pages in memory.
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

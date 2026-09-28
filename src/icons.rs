@@ -1,7 +1,7 @@
 //! File-type icons (Nerd Font glyphs) and their colors, as in nvim-web-devicons.
 //! Set NIB_NO_ICONS=1 if the terminal font has no Nerd Font glyphs.
 
-use ratatui::style::Color;
+use ratatui_core::style::Color;
 
 const fn rgb(hex: u32) -> Color {
     Color::Rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)

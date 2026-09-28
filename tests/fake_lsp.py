@@ -109,10 +109,24 @@ def main():
     if pidfile:
         with open(pidfile, "w") as f:
             f.write(str(os.getpid()))
+        # A helper process, like real servers start (e.g. rust-analyzer's proc-macro server).
+        import subprocess
+        helper = subprocess.Popen(["sleep", "300"], stdin=subprocess.DEVNULL)
+        with open(pidfile + ".helper", "w") as f:
+            f.write(str(helper.pid))
+        # Stubborn mode: ignore exit requests and SIGTERM (needs SIGKILL).
+        if os.path.exists(pidfile + ".stubborn"):
+            import signal
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            os.environ["FAKE_STUBBORN"] = "1"
 
+    stubborn = os.environ.get("FAKE_STUBBORN") == "1"
     while True:
         msg = read()
         if msg is None:
+            while stubborn:
+                import time
+                time.sleep(1)
             return
         method = msg.get("method")
         if method:
@@ -182,7 +196,8 @@ def main():
         elif method == "shutdown":
             send({"id": mid, "result": None})
         elif method == "exit":
-            return
+            if not stubborn:
+                return
         elif mid is not None:
             send({"id": mid, "result": None})
 

@@ -1,13 +1,14 @@
 //! Drawing. Colors are a Tokyo Night–style palette on the terminal's own
 //! background, so nib blends into whatever theme the terminal uses.
 
-use ratatui::{
-    layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
-    Frame,
-};
+use ratatui_core::layout::{Constraint, Layout, Rect};
+use ratatui_core::style::{Color, Modifier, Style};
+use ratatui_core::terminal::Frame;
+use ratatui_core::text::{Line, Span};
+use ratatui_widgets::block::Block;
+use ratatui_widgets::borders::Borders;
+use ratatui_widgets::clear::Clear;
+use ratatui_widgets::paragraph::Paragraph;
 
 use crate::app::{severity_label, After, App, Focus, Popup, Prompt};
 use crate::lsp::{Diag, Severity};
@@ -446,4 +447,13 @@ fn draw_popup(f: &mut Frame, app: &App) {
         ),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn screen_cells_stay_small() {
+        // Two full-screen buffers of these are the biggest part of nib's heap.
+        assert!(std::mem::size_of::<ratatui_core::buffer::Cell>() <= 40, "underline-color feature crept back in?");
+    }
 }

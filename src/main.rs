@@ -1,13 +1,8 @@
-use std::io::stdout;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Instant;
 
-use crossterm::event::{
-    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange,
-    EnableMouseCapture, Event, KeyEventKind,
-};
-use crossterm::execute;
+use crossterm::event::{self, Event, KeyEventKind};
 use nib::app::App;
 use nib::lsp::{Lsp, Wake};
 
@@ -20,6 +15,91 @@ usage: nib [folder | file]
   nib <file>     open a file (creates it on first save if missing)
   nib plugin     manage language-server plugins (list, add, new, remove)
   nib config     create/check the config file (~/.config/nib/config.nib)";
+
+/// SIGHUP (terminal window closed) and SIGTERM (`kill`) become a normal
+/// quit: the handler writes a byte to a pipe, and a watcher thread turns that
+/// into `Wake::Closed`, so auto-save flushes and language servers are stopped.
+mod signals {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::mpsc::Sender;
+
+    use nib::lsp::Wake;
+
+    static PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
+
+    unsafe extern "C" {
+        fn pipe(fds: *mut i32) -> i32;
+        fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
+        fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+
+    extern "C" fn on_signal(_: i32) {
+        // Only async-signal-safe work here: one write(2).
+        unsafe { write(PIPE_WRITE.load(Ordering::Relaxed), [1u8].as_ptr(), 1) };
+    }
+
+    pub fn watch(tx: Sender<Wake>) {
+        let mut fds = [0i32; 2];
+        // SAFETY: plain syscalls; the handler only calls write(2).
+        unsafe {
+            if pipe(fds.as_mut_ptr()) != 0 {
+                return;
+            }
+            PIPE_WRITE.store(fds[1], Ordering::Relaxed);
+            const SIGHUP: i32 = 1;
+            const SIGTERM: i32 = 15;
+            signal(SIGHUP, on_signal as extern "C" fn(i32) as usize);
+            signal(SIGTERM, on_signal as extern "C" fn(i32) as usize);
+        }
+        std::thread::Builder::new()
+            .stack_size(16 * 1024)
+            .spawn(move || {
+                let mut b = 0u8;
+                if unsafe { read(fds[0], &mut b, 1) } > 0 {
+                    let _ = tx.send(Wake::Closed);
+                }
+            })
+            .ok();
+    }
+}
+
+/// Raw mode + alternate screen, restored on exit and on panic.
+mod terminal {
+    use std::io::{stdout, Stdout};
+
+    use crossterm::event::{
+        DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange,
+        EnableMouseCapture,
+    };
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+    use crossterm::{cursor, execute};
+    use ratatui_core::terminal::Terminal;
+    use ratatui_crossterm::CrosstermBackend;
+
+    pub fn enter() -> std::io::Result<Terminal<CrosstermBackend<Stdout>>> {
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            leave();
+            hook(info);
+        }));
+        enable_raw_mode()?;
+        execute!(stdout(), EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste, EnableFocusChange)?;
+        Terminal::new(CrosstermBackend::new(stdout()))
+    }
+
+    pub fn leave() {
+        let _ = execute!(
+            stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            DisableFocusChange,
+            LeaveAlternateScreen,
+            cursor::Show
+        );
+        let _ = disable_raw_mode();
+    }
+}
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -51,20 +131,26 @@ fn main() -> std::io::Result<()> {
     let idle = cfg.settings.lsp_idle_timeout;
     app.apply_config(cfg);
 
-    let mut term = ratatui::init();
-    execute!(stdout(), EnableMouseCapture, EnableBracketedPaste, EnableFocusChange)?;
+    let mut term = terminal::enter()?;
 
     // Keyboard input and language-server messages arrive on one channel, so
     // the loop sleeps until something happens (or a timer is due).
     let (tx, rx) = mpsc::channel();
     let input = tx.clone();
-    std::thread::spawn(move || {
-        while let Ok(ev) = event::read() {
-            if input.send(Wake::Term(ev)).is_err() {
+    signals::watch(tx.clone());
+    std::thread::Builder::new().stack_size(64 * 1024).spawn(move || loop {
+        match event::read() {
+            Ok(ev) => {
+                if input.send(Wake::Term(ev)).is_err() {
+                    break;
+                }
+            }
+            Err(_) => {
+                let _ = input.send(Wake::Closed);
                 break;
             }
         }
-    });
+    })?;
     let mut warnings = config_errors;
     if lsp_enabled {
         let (plugins, plugin_warnings) = nib::plugin::load();
@@ -100,6 +186,7 @@ fn main() -> std::io::Result<()> {
                     Wake::Term(Event::FocusLost) => app.flush(),
                     Wake::Term(_) => {}
                     Wake::Lsp(id, msg) => app.on_lsp(id, msg),
+                    Wake::Closed => app.quit = true,
                 }
                 if app.quit {
                     break;
@@ -113,7 +200,6 @@ fn main() -> std::io::Result<()> {
     app.flush();
     // Dropping the client kills every server right away.
     app.lsp = None;
-    let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste, DisableFocusChange);
-    ratatui::restore();
+    terminal::leave();
     res
 }

@@ -51,6 +51,13 @@ impl Drop for Fixture {
     }
 }
 
+/// An empty config folder, so tests never load the user's config or plugins.
+fn isolated_config() -> PathBuf {
+    let d = std::env::temp_dir().join(format!("nib-e2e-noconfig-{}", std::process::id()));
+    fs::create_dir_all(&d).unwrap();
+    d
+}
+
 struct Tmux(String);
 
 impl Tmux {
@@ -60,6 +67,8 @@ impl Tmux {
         let ok = Command::new("tmux")
             .args(["new-session", "-d", "-s", &name, "-x", "160", "-y", "40", "-c"])
             .arg(cwd)
+            .arg("env")
+            .arg(format!("XDG_CONFIG_HOME={}", isolated_config().display()))
             .arg(env!("CARGO_BIN_EXE_nib"))
             .arg(arg)
             .status()

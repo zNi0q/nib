@@ -32,6 +32,8 @@ pub enum Wake {
     Term(crossterm::event::Event),
     /// A message from server `id`; `None` when the server exited.
     Lsp(usize, Option<Value>),
+    /// The terminal went away (window closed): save and clean up.
+    Closed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -126,22 +128,69 @@ impl Server {
         if matches!(self.pending[&self.next_req], Req::Initialize) { self.write(&msg) } else { self.send(msg) }
     }
 
-    /// Ask politely, then make sure it's gone without blocking the editor.
-    fn stop(mut self) {
+    /// Ask the server to exit and hand back its process for cleanup.
+    fn ask_exit(mut self) -> Child {
         self.ready = true;
         self.request("shutdown", Value::Null, Req::Other);
         self.notify("exit", Value::Null);
-        let mut child = self.child;
-        std::thread::spawn(move || {
-            for _ in 0..10 {
-                if matches!(child.try_wait(), Ok(Some(_))) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-        });
+        self.child
+    }
+
+    /// Stop in the background (idle timeout) without blocking the editor.
+    fn stop(self) {
+        let child = self.ask_exit();
+        std::thread::spawn(move || reap(vec![child], Duration::from_millis(500)));
+    }
+}
+
+/// Give servers `grace` to exit on their own, then end their whole process
+/// groups (servers often start helper processes) and collect them.
+fn reap(mut children: Vec<Child>, grace: Duration) {
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline && children.iter_mut().any(|c| matches!(c.try_wait(), Ok(None))) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for c in &children {
+        sys::kill_group(c.id(), sys::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < deadline && children.iter().any(|c| sys::group_alive(c.id())) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for c in &mut children {
+        sys::kill_group(c.id(), sys::SIGKILL);
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+}
+
+/// The few OS calls needed for clean process handling (no libc crate).
+mod sys {
+    pub const SIGTERM: i32 = 15;
+    pub const SIGKILL: i32 = 9;
+
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+        #[cfg(target_os = "linux")]
+        fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
+    }
+
+    /// Signal every process in the group led by `pgid`.
+    pub fn kill_group(pgid: u32, sig: i32) {
+        unsafe { kill(-(pgid as i32), sig) };
+    }
+
+    pub fn group_alive(pgid: u32) -> bool {
+        unsafe { kill(-(pgid as i32), 0) == 0 }
+    }
+
+    /// In the child before exec: get SIGTERM if nib dies (even from a crash).
+    pub fn die_with_parent() {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            const PR_SET_PDEATHSIG: i32 = 1;
+            prctl(PR_SET_PDEATHSIG, SIGTERM as u64, 0, 0, 0);
+        }
     }
 }
 
@@ -335,6 +384,7 @@ impl Lsp {
             let i = self.servers.iter().position(|s| s.id == id)?;
             let s = self.servers.remove(i);
             let mut child = s.child;
+            sys::kill_group(child.id(), sys::SIGKILL); // helpers it left behind
             let _ = child.kill();
             let _ = child.wait();
             if self.doc.as_ref().is_some_and(|d| d.server == id) {
@@ -472,7 +522,21 @@ impl Lsp {
             let hint = p.install.as_deref().unwrap_or("see `nib plugin list`");
             return Err(format!("LSP: {} not found — install: {hint}", p.command));
         };
-        let mut child = Command::new(exe)
+        let mut cmd = Command::new(exe);
+        // Own process group, so the server and anything it starts can be
+        // stopped together; and it dies with nib even if nib crashes.
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+            // SAFETY: prctl is async-signal-safe and touches no Rust state.
+            unsafe {
+                cmd.pre_exec(|| {
+                    sys::die_with_parent();
+                    Ok(())
+                });
+            }
+        }
+        let mut child = cmd
             .args(&p.args)
             .envs(&p.env)
             .current_dir(root)
@@ -486,7 +550,8 @@ impl Lsp {
         let id = self.next_id;
         self.next_id += 1;
         let tx = self.tx.clone();
-        std::thread::spawn(move || {
+        let reader = std::thread::Builder::new().stack_size(256 * 1024);
+        let _ = reader.spawn(move || {
             let mut r = BufReader::new(stdout);
             loop {
                 match read_message(&mut r) {
@@ -546,11 +611,10 @@ impl Lsp {
 }
 
 impl Drop for Lsp {
+    /// nib is exiting: stop every server and its helpers before we go.
     fn drop(&mut self) {
-        for mut s in std::mem::take(&mut self.servers) {
-            let _ = s.child.kill();
-            let _ = s.child.wait();
-        }
+        let children = std::mem::take(&mut self.servers).into_iter().map(Server::ask_exit).collect();
+        reap(children, Duration::from_millis(300));
     }
 }
 
