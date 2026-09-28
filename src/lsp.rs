@@ -369,7 +369,7 @@ impl Lsp {
             if let Some(req_id) = msg.get("id") {
                 let result = match method {
                     "workspace/configuration" => {
-                        let settings = s.plugin.settings.as_ref().and_then(|v| serde_json::to_value(v).ok());
+                        let settings = s.plugin.settings.as_ref().map(crate::toml::to_json);
                         let items = msg.pointer("/params/items").and_then(Value::as_array).cloned().unwrap_or_default();
                         Value::Array(items.iter().map(|it| config_section(settings.as_ref(), it.get("section").and_then(Value::as_str))).collect())
                     }
@@ -543,7 +543,7 @@ impl Lsp {
             pull_diags: false,
         };
         let root_uri = path_to_uri(root);
-        let init_options = p.init_options.as_ref().and_then(|v| serde_json::to_value(v).ok());
+        let init_options = p.init_options.as_ref().map(crate::toml::to_json);
         s.request("initialize", json!({
             "processId": std::process::id(),
             "clientInfo": {"name": "nib", "version": env!("CARGO_PKG_VERSION")},

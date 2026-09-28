@@ -2,10 +2,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use toml::{Table, Value};
 
 use crate::app::{Cmd, COMMANDS};
 use crate::theme::{self, Theme};
+use crate::toml::{self, Table, Value};
 
 pub const FILE: &str = "config.nib";
 
@@ -71,11 +71,10 @@ pub fn load() -> (Config, Vec<String>) {
 pub fn parse(text: &str) -> (Config, Vec<String>) {
     let mut cfg = Config::default();
     let mut errs = Vec::new();
-    let table: Table = match toml::from_str(text) {
+    let table: Table = match toml::parse(text) {
         Ok(t) => t,
         Err(e) => {
-            let line = e.span().map_or(0, |s| text[..s.start.min(text.len())].matches('\n').count() + 1);
-            errs.push(format!("{FILE}: line {line}: {}", e.message().trim()));
+            errs.push(format!("{FILE}: line {}: {}", e.line, e.message));
             return (cfg, errs);
         }
     };
@@ -96,7 +95,7 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
 }
 
 fn int(t: &Table, sec: &str, key: &str, min: i64, max: i64, errs: &mut Vec<String>) -> Option<i64> {
-    let v = t.get(key)?;
+    let v = toml::get(t, key)?;
     match v.as_integer() {
         Some(n) if (min..=max).contains(&n) => Some(n),
         _ => {
@@ -107,7 +106,7 @@ fn int(t: &Table, sec: &str, key: &str, min: i64, max: i64, errs: &mut Vec<Strin
 }
 
 fn boolean(t: &Table, sec: &str, key: &str, errs: &mut Vec<String>) -> Option<bool> {
-    let v = t.get(key)?;
+    let v = toml::get(t, key)?;
     if v.as_bool().is_none() {
         errs.push(format!("{FILE}: [{sec}] {key} must be true or false"));
     }
@@ -115,7 +114,7 @@ fn boolean(t: &Table, sec: &str, key: &str, errs: &mut Vec<String>) -> Option<bo
 }
 
 fn unknown(t: &Table, sec: &str, known: &[&str], errs: &mut Vec<String>) {
-    for k in t.keys().filter(|k| !known.contains(&k.as_str())) {
+    for (k, _) in t.iter().filter(|(k, _)| !known.contains(&k.as_str())) {
         errs.push(format!("{FILE}: [{sec}] unknown setting {k:?}"));
     }
 }
@@ -154,7 +153,7 @@ fn lsp(t: &Table, s: &mut Settings, errs: &mut Vec<String>) {
 
 fn theme_section(t: &Table, errs: &mut Vec<String>) -> Theme {
     let mut th = theme::TOKYONIGHT;
-    if let Some(v) = t.get("name") {
+    if let Some(v) = toml::get(t, "name") {
         match v.as_str().and_then(theme::builtin) {
             Some(b) => th = b,
             None => errs.push(format!("{FILE}: [theme] name must be one of {}", theme::NAMES.join(", "))),

@@ -7,5 +7,6 @@ pub mod lsp;
 pub mod plugin;
 pub mod screen;
 pub mod theme;
+pub mod toml;
 pub mod tree;
 pub mod ui;
