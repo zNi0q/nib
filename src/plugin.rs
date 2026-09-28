@@ -2,39 +2,93 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use crate::toml::{self, Table, Value};
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub struct Plugin {
     pub name: String,
     pub command: String,
-    #[serde(default)]
     pub args: Vec<String>,
     pub extensions: Vec<String>,
-    #[serde(default)]
     pub language_ids: HashMap<String, String>,
-    #[serde(default = "default_roots")]
     pub root_markers: Vec<String>,
-    #[serde(default)]
     pub idle_timeout: Option<u64>,
-    #[serde(default)]
     pub env: HashMap<String, String>,
-    #[serde(default)]
-    pub init_options: Option<toml::Value>,
-    #[serde(default)]
-    pub settings: Option<toml::Value>,
-    #[serde(default = "yes")]
+    pub init_options: Option<Value>,
+    pub settings: Option<Value>,
     pub enabled: bool,
-    #[serde(default)]
     pub install: Option<String>,
 }
 
-fn default_roots() -> Vec<String> {
-    vec![".git".into()]
+const FIELDS: &[&str] = &[
+    "name", "command", "args", "extensions", "language_ids", "root_markers", "idle_timeout", "env", "init_options",
+    "settings", "enabled", "install",
+];
+
+fn string_field(t: &Table, key: &str) -> Result<Option<String>, String> {
+    match toml::get(t, key) {
+        None => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(format!("`{key}` must be a string")),
+    }
 }
-fn yes() -> bool {
-    true
+
+fn required_string(t: &Table, key: &str) -> Result<String, String> {
+    string_field(t, key)?.ok_or_else(|| format!("missing field `{key}`"))
+}
+
+fn string_list(t: &Table, key: &str) -> Result<Option<Vec<String>>, String> {
+    match toml::get(t, key) {
+        None => Ok(None),
+        Some(Value::Array(a)) if a.iter().all(Value::is_str) => {
+            Ok(Some(a.iter().filter_map(Value::as_str).map(str::to_string).collect()))
+        }
+        Some(_) => Err(format!("`{key}` must be a list of strings")),
+    }
+}
+
+fn string_map(t: &Table, key: &str) -> Result<HashMap<String, String>, String> {
+    match toml::get(t, key) {
+        None => Ok(HashMap::new()),
+        Some(Value::Table(m)) => m
+            .iter()
+            .map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())).ok_or_else(|| format!("`{key}.{k}` must be a string")))
+            .collect(),
+        Some(_) => Err(format!("`{key}` must be a table of strings")),
+    }
+}
+
+impl Plugin {
+    pub fn parse(text: &str) -> Result<Plugin, String> {
+        let t = toml::parse(text).map_err(|e| e.to_string())?;
+        if let Some((k, _)) = t.iter().find(|(k, _)| !FIELDS.contains(&k.as_str())) {
+            return Err(format!("unknown field `{k}`"));
+        }
+        let idle_timeout = match toml::get(&t, "idle_timeout") {
+            None => None,
+            Some(Value::Integer(n)) if *n >= 0 => Some(*n as u64),
+            Some(_) => return Err("`idle_timeout` must be a number of seconds".into()),
+        };
+        let enabled = match toml::get(&t, "enabled") {
+            None => true,
+            Some(Value::Boolean(b)) => *b,
+            Some(_) => return Err("`enabled` must be true or false".into()),
+        };
+        Ok(Plugin {
+            name: required_string(&t, "name")?,
+            command: required_string(&t, "command")?,
+            args: string_list(&t, "args")?.unwrap_or_default(),
+            extensions: string_list(&t, "extensions")?.ok_or("missing field `extensions`")?,
+            language_ids: string_map(&t, "language_ids")?,
+            root_markers: string_list(&t, "root_markers")?.unwrap_or_else(|| vec![".git".into()]),
+            idle_timeout,
+            env: string_map(&t, "env")?,
+            init_options: toml::get(&t, "init_options").cloned(),
+            settings: toml::get(&t, "settings").cloned(),
+            enabled,
+            install: string_field(&t, "install")?,
+        })
+    }
 }
 
 impl Plugin {
@@ -63,7 +117,7 @@ pub fn load() -> (Vec<Plugin>, Vec<String>) {
     files.sort();
     for f in files {
         let name = f.file_name().unwrap().to_string_lossy().into_owned();
-        match fs::read_to_string(&f).map_err(|e| e.to_string()).and_then(|s| toml::from_str::<Plugin>(&s).map_err(|e| e.message().to_string())) {
+        match fs::read_to_string(&f).map_err(|e| e.to_string()).and_then(|s| Plugin::parse(&s)) {
             Ok(p) => plugins.push(p),
             Err(e) => warnings.push(format!("Plugin {name}: {e}")),
         }
@@ -350,7 +404,7 @@ fn install(names: &[String]) -> i32 {
     let home = home();
     let mut failed = Vec::new();
     for (name, body) in chosen {
-        let p: Plugin = toml::from_str(&body).expect("valid preset");
+        let p = Plugin::parse(&body).expect("valid preset");
         println!("==> {name} ({})", p.command);
         if let Some(found) = resolve_command(&p.command) {
             println!("    already installed: {}", found.display());
@@ -469,24 +523,33 @@ mod tests {
     #[test]
     fn every_preset_parses() {
         for (name, body) in presets() {
-            let p: Plugin = toml::from_str(&body).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let p = Plugin::parse(&body).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(p.name, name);
             assert!(p.install.is_some(), "{name} has an install hint");
             assert!(!p.extensions.is_empty());
         }
-        let t: Plugin = toml::from_str(&TEMPLATE.replace("{name}", "x")).unwrap();
+        let t = Plugin::parse(&TEMPLATE.replace("{name}", "x")).unwrap();
         assert_eq!(t.idle_timeout, Some(120));
     }
 
     #[test]
     fn defaults_and_language_ids() {
-        let p: Plugin = toml::from_str("name='a'\ncommand='a'\nextensions=['ts','x']\nlanguage_ids={ts='typescript'}").unwrap();
+        let p = Plugin::parse("name='a'\ncommand='a'\nextensions=['ts','x']\nlanguage_ids={ts='typescript'}").unwrap();
         assert_eq!(p.root_markers, [".git"]);
         assert_eq!(p.idle_timeout, None, "falls back to [lsp] idle_timeout");
         assert!(p.enabled && p.handles("TS") && !p.handles("rs"));
         assert_eq!(p.language_id("ts"), "typescript");
         assert_eq!(p.language_id("x"), "x");
-        assert!(toml::from_str::<Plugin>("name='a'\ncommand='a'\nextensions=[]\ntypo=1").is_err(), "unknown keys are errors");
+        assert_eq!(Plugin::parse("name='a'\ncommand='a'\nextensions=[]\ntypo=1").unwrap_err(), "unknown field `typo`");
+        assert_eq!(Plugin::parse("command='a'\nextensions=[]").unwrap_err(), "missing field `name`");
+        assert_eq!(Plugin::parse("name='a'\ncommand='a'").unwrap_err(), "missing field `extensions`");
+        assert_eq!(Plugin::parse("name='a'\ncommand='a'\nextensions='ts'").unwrap_err(), "`extensions` must be a list of strings");
+        assert_eq!(Plugin::parse("name='a'\ncommand='a'\nextensions=[]\nenv={X=1}").unwrap_err(), "`env.X` must be a string");
+        assert!(Plugin::parse("name='a'\ncommand='a'\nextensions=[]\nidle_timeout=-5").is_err());
+        assert!(Plugin::parse("name = 'a'\nname = 'b'").unwrap_err().starts_with("line 2:"));
+        let full = Plugin::parse("name='a'\ncommand='a'\nextensions=['x']\nenabled=false\nidle_timeout=5\ninit_options={a={b=1}}\nsettings={css={validate=true}}").unwrap();
+        assert!(!full.enabled && full.idle_timeout == Some(5));
+        assert_eq!(full.init_options.as_ref().map(toml::to_json), Some(serde_json::json!({"a": {"b": 1}})));
     }
 
     #[test]
